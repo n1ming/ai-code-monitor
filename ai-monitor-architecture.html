@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 监控脚本架构图</title>
+<style>
+  :root {
+    --agent: #2563eb;
+    --supervisor: #dc2626;
+    --script: #16a34a;
+    --pid: #4b5563;
+    --prompt: #d97706;
+    --bg: #f4f5f7;
+    --panel: #fff;
+    --line: #d1d5db;
+    --muted: #6b7280;
+    --ink: #111827;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: linear-gradient(180deg, #e5e7eb 0, var(--bg) 240px), var(--bg);
+    -webkit-font-smoothing: antialiased;
+    padding: 32px 24px 48px;
+  }
+
+  .container {
+    max-width: 1360px;
+    margin: 0 auto;
+  }
+
+  /* ── Header ── */
+  .header { margin-bottom: 28px; }
+  h1 { font-size: 34px; font-weight: 780; letter-spacing: -.5px; }
+  .subtitle { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1.6; max-width: 800px; }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 10px 20px;
+    margin-top: 16px; padding: 10px 16px;
+    border: 1px solid var(--line); border-radius: 8px;
+    background: rgba(255,255,255,.8);
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+  .swatch { width: 28px; height: 4px; border-radius: 99px; }
+  .swatch.pid      { background: var(--pid); }
+  .swatch.prompt   { background: var(--prompt); border-top: 2px dashed #fff; height: 6px; }
+  .swatch.ipc      { background: var(--supervisor); }
+  .swatch.lifecycle{ background: var(--script); }
+
+  /* ── Section titles ── */
+  .section-label {
+    display: flex; align-items: center; gap: 10px; margin: 28px 0 14px;
+    font-size: 15px; font-weight: 750; color: var(--muted); text-transform: uppercase;
+  }
+  .section-label::after {
+    content: ""; flex: 1; height: 1px; background: var(--line);
+  }
+
+  /* ═══ CONFIG PANEL ═══ */
+  .config-panel {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
+    padding: 20px;
+    border: 1px solid #c4cdd8; border-radius: 10px;
+    background: #fff;
+    box-shadow: 0 4px 16px rgba(0,0,0,.04);
+  }
+  .config-cell {
+    padding: 14px;
+    border: 1px solid #e5e7eb; border-radius: 8px;
+    background: #f9fafb;
+  }
+  .config-cell h4 { font-size: 14px; font-weight: 700; margin-bottom: 5px; }
+  .config-cell p  { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+  .config-cell code {
+    display: inline-block; margin-top: 4px; padding: 2px 6px;
+    border-radius: 5px; background: #e5e7eb; color: #1f2937;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .92em;
+  }
+
+  /* ↓ Arrow from config to workspaces */
+  .flow-arrow {
+    display: flex; align-items: center; justify-content: center;
+    padding: 12px 0 8px; color: var(--script); font-size: 13px; font-weight: 700;
+  }
+  .flow-arrow::before,
+  .flow-arrow::after {
+    content: ""; height: 2px; background: var(--script); flex: 1; max-width: 60px;
+  }
+  .flow-arrow::before { margin-right: 10px; }
+  .flow-arrow::after  { margin-left: 10px; }
+  .flow-arrow .arr-down {
+    display: block; margin: 4px auto 0; width: 0; height: 0;
+    border-left: 8px solid transparent; border-right: 8px solid transparent;
+    border-top: 10px solid var(--script);
+  }
+
+  /* ═══ WORKSPACES ROW ═══ */
+  .workspaces-row {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;
+  }
+
+  .workspace {
+    border: 1px solid #c4cdd8; border-radius: 10px;
+    background: #fff;
+    box-shadow: 0 4px 16px rgba(0,0,0,.04);
+    overflow: hidden;
+  }
+  .ws-header {
+    padding: 14px 18px;
+    font-size: 16px; font-weight: 750;
+    border-bottom: 1px solid #e5e7eb;
+    background: #fafbfc;
+  }
+
+  .ws-body { padding: 14px 16px; display: grid; gap: 12px; }
+
+  /* ── Node ── */
+  .node {
+    border: 1px solid var(--line); border-left: 5px solid var(--pid);
+    border-radius: 8px; padding: 13px 14px 12px; background: #fff;
+  }
+  .node.agent      { border-left-color: var(--agent); }
+  .node.supervisor { border-left-color: var(--supervisor); }
+  .node.script     { border-left-color: var(--script); }
+  .node.config     { border-left-color: var(--pid); background: #fafbfc; }
+
+  .node-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 6px; font-size: 14px; font-weight: 700;
+  }
+  .node p { font-size: 12px; color: var(--muted); line-height: 1.5; }
+
+  .pill {
+    padding: 2px 8px; border-radius: 99px;
+    color: #fff; font-size: 11px; font-weight: 700; white-space: nowrap;
+  }
+  .pill.agent      { background: var(--agent); }
+  .pill.supervisor { background: var(--supervisor); }
+  .pill.script     { background: var(--script); }
+  .pill.pid        { background: var(--pid); }
+
+  .poll-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    margin-top: 6px; padding: 3px 8px; border-radius: 99px;
+    background: #fef2f2; color: #b91c1c; font-size: 11px; font-weight: 700;
+  }
+  .poll-badge::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%;
+    background: #ef4444; animation: pulse 1.5s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  .tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+  .tag {
+    padding: 2px 7px; border-radius: 5px;
+    background: #eef2ff; color: #4338ca; font-size: 11px; font-weight: 600;
+  }
+  .tag.prompt-tag { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
+
+  /* ── IPC arrow between supervisor and agent ── */
+  .ipc-indicator {
+    display: flex; align-items: center; justify-content: center;
+    height: 0; position: relative;
+  }
+  .ipc-indicator::before {
+    content: "▲ 轮询 Agent PID / ▼ 发送继续工作提示词";
+    position: absolute;
+    top: -10px;
+    font-size: 10.5px; font-weight: 700;
+    color: var(--supervisor); white-space: nowrap;
+  }
+
+  /* ── Prompt arrow between agent and script ── */
+  .prompt-indicator {
+    display: flex; align-items: center; justify-content: center;
+    height: 0; position: relative; margin: 2px 0;
+  }
+  .prompt-indicator::before {
+    content: "▼ 提示词监控脚本 PID ▼";
+    position: absolute;
+    top: -9px;
+    font-size: 10.5px; font-weight: 700;
+    color: var(--prompt); white-space: nowrap;
+  }
+
+  /* ↓ Arrow from workspaces to PID bus */
+  .to-bus-arrow {
+    display: flex; align-items: center; justify-content: center;
+    padding: 14px 0 4px; color: var(--pid); font-size: 13px; font-weight: 700;
+  }
+  .to-bus-arrow .arr-down {
+    display: block; margin: 4px auto 0; width: 0; height: 0;
+    border-left: 8px solid transparent; border-right: 8px solid transparent;
+    border-top: 10px solid var(--pid);
+  }
+
+  /* ═══ PID BUS ═══ */
+  .pid-bus {
+    border: 2px solid var(--pid); border-radius: 10px;
+    padding: 16px 20px; background: #f8fafc;
+  }
+  .pid-bus h3 {
+    font-size: 16px; font-weight: 800; margin-bottom: 4px;
+  }
+  .pid-bus .bus-sub {
+    font-size: 12.5px; color: var(--muted); margin-bottom: 14px;
+  }
+  .pid-bus-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  }
+  .bus-item {
+    padding: 12px 14px; border: 1px solid #d1d5db; border-radius: 8px;
+    background: #fff; font-size: 12.5px; line-height: 1.45;
+  }
+  .bus-item strong { display: block; margin-bottom: 4px; color: var(--pid); font-size: 13px; }
+
+  /* ═══ NOTES ═══ */
+  .notes {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 20px;
+  }
+  .note {
+    padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px;
+    background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,.03);
+  }
+  .note h4 { font-size: 14px; margin-bottom: 6px; }
+  .note p  { font-size: 12.5px; color: var(--muted); line-height: 1.55; }
+
+  code {
+    padding: 1px 5px; border-radius: 4px;
+    background: #e5e7eb; color: #1f2937;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .93em;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 1100px) {
+    .config-panel { grid-template-columns: repeat(2, 1fr); }
+    .workspaces-row { grid-template-columns: 1fr; }
+    .pid-bus-grid { grid-template-columns: repeat(2, 1fr); }
+    .notes { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 600px) {
+    .config-panel, .pid-bus-grid { grid-template-columns: 1fr; }
+    body { padding: 16px 10px 24px; }
+    h1 { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- ═══ HEADER ═══ -->
+  <div class="header">
+    <h1>AI 监控脚本 — 多工作区架构</h1>
+    <p class="subtitle">
+      每个工作区由一个 Agent（Codex / Claude Code / 其它）负责，通过<strong>提示词</strong>与启动脚本建立逻辑连接（非代码连接）；
+      监督脚本以<strong>用户可配的轮询间隔</strong>检查 Agent 是否持续工作，所有组件通过 <strong>PID</strong> 实现进程级通信与结果回传。
+    </p>
+    <div class="legend">
+      <div class="legend-item"><span class="swatch pid"></span> PID 注册 / 结果返回</div>
+      <div class="legend-item"><span class="swatch prompt"></span> 提示词通道（非代码连接）</div>
+      <div class="legend-item"><span class="swatch ipc"></span> 监督轮询 / IPC</div>
+      <div class="legend-item"><span class="swatch lifecycle"></span> 启动 &amp; 生命周期</div>
+    </div>
+  </div>
+
+  <!-- ═══ USER CONFIG ═══ -->
+  <div class="section-label">用户启动与配置入口</div>
+  <div class="config-panel">
+    <div class="config-cell">
+      <h4>① 选择工作区</h4>
+      <p>绑定项目路径、脚本结构、目标启动命令。<br><code>python app.py</code></p>
+    </div>
+    <div class="config-cell">
+      <h4>② 选择 Agent</h4>
+      <p>Codex / Claude Code / 其它任意 Agent 工具，每个工作区独立选择。</p>
+    </div>
+    <div class="config-cell">
+      <h4>③ 设置 PID</h4>
+      <p>用户可手动指定；未指定时系统自动生成。Agent、启动脚本、监督脚本各自持有 PID。</p>
+    </div>
+    <div class="config-cell">
+      <h4>④ 监督轮询配置</h4>
+      <p>用户自定义轮询间隔（如 30s / 60s）；监督脚本据此周期性检查 Agent 工作状态。</p>
+    </div>
+  </div>
+
+  <!-- ↓ Lifecycle arrow -->
+  <div style="text-align:center; padding:16px 0 4px;">
+    <span style="font-size:13px; font-weight:700; color:#16a34a;">▼ 按工作区配置启动：python app.py —pid=xxx &nbsp;+&nbsp; agent start —pid=xxx &nbsp;+&nbsp; watchdog start —pid=xxx ▼</span>
+  </div>
+
+  <!-- ═══ THREE WORKSPACES ═══ -->
+  <div class="section-label">工作区</div>
+  <div class="workspaces-row">
+
+    <!-- ── Workspace A ── -->
+    <div class="workspace">
+      <div class="ws-header">工作区 A</div>
+      <div class="ws-body">
+
+        <!-- Agent -->
+        <div class="node agent">
+          <div class="node-head">Agent 进程 <span class="pill agent">pid=agent-A</span></div>
+          <p>接收提示词，通过 PID 定位目标脚本进程，检查运行状态；需要时修改代码或发送运行指令。</p>
+          <div class="tags">
+            <span class="tag">Codex</span>
+            <span class="tag">Claude Code</span>
+            <span class="tag">Other</span>
+            <span class="tag prompt-tag">提示词连接</span>
+          </div>
+        </div>
+
+        <!-- IPC: Supervisor ↔ Agent -->
+        <div style="text-align:center; font-size:10.5px; font-weight:700; color:#dc2626; padding:2px 0;">
+          ▲ 轮询 Agent 状态 (IPC) &nbsp;|&nbsp; 发送继续工作提示词 ▼
+        </div>
+
+        <!-- Supervisor -->
+        <div class="node supervisor">
+          <div class="node-head">监督脚本 <span class="pill supervisor">pid=watch-A</span></div>
+          <p>以轮询方式检查 Agent（pid=agent-A）是否处于工作状态；若空闲则通过 Agent PID 发送继续工作提示词。</p>
+          <div class="poll-badge">轮询间隔: 30s（用户可配）</div>
+        </div>
+
+        <!-- Prompt: Agent → Script -->
+        <div style="text-align:center; font-size:10.5px; font-weight:700; color:#d97706; padding:2px 0;">
+          ▼ 提示词通道：Agent 监控脚本 PID（非代码连接） ▼
+        </div>
+
+        <!-- Startup Script -->
+        <div class="node script">
+          <div class="node-head">启动脚本 <span class="pill script">pid=script-A</span></div>
+          <p>业务入口：<code>python app.py —pid=script-A</code>。启动后注册 PID，Agent 根据提示词持续监控此进程。</p>
+        </div>
+
+        <!-- Script structure -->
+        <div class="node config">
+          <div class="node-head">脚本结构 &amp; 并发 <span class="pill pid">线程 PID 自动分配</span></div>
+          <p>多线程 / 子进程各自占有 PID；Agent 通过 PID 精确定位需要监控的脚本或任务。</p>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ── Workspace B ── -->
+    <div class="workspace">
+      <div class="ws-header">工作区 B</div>
+      <div class="ws-body">
+
+        <div class="node agent">
+          <div class="node-head">Agent 进程 <span class="pill agent">pid=agent-B</span></div>
+          <p>Agent 类型独立选择，不同工作区可使用不同工具，灵活适配各类场景。</p>
+          <div class="tags">
+            <span class="tag">模型工具</span>
+            <span class="tag">终端会话</span>
+            <span class="tag prompt-tag">提示词上下文</span>
+          </div>
+        </div>
+
+        <div style="text-align:center; font-size:10.5px; font-weight:700; color:#dc2626; padding:2px 0;">
+          ▲ 轮询 Agent 状态 (IPC) &nbsp;|&nbsp; 发送继续工作提示词 ▼
+        </div>
+
+        <div class="node supervisor">
+          <div class="node-head">监督脚本 <span class="pill supervisor">pid=watch-B</span></div>
+          <p>保存轮询间隔、Agent PID、失败重试策略与继续工作提示词模板。</p>
+          <div class="poll-badge">轮询间隔: 60s（用户可配）</div>
+        </div>
+
+        <div style="text-align:center; font-size:10.5px; font-weight:700; color:#d97706; padding:2px 0;">
+          ▼ 提示词通道：Agent 监控脚本 PID（非代码连接） ▼
+        </div>
+
+        <div class="node script">
+          <div class="node-head">启动脚本 <span class="pill script">pid=script-B</span></div>
+          <p>启动命令可为任意入口：<code>node server.js —pid=script-B</code> 或其它。</p>
+        </div>
+
+        <div class="node config">
+          <div class="node-head">工作区配置 <span class="pill pid">workspace=B</span></div>
+          <p>集中保存路径、PID 映射、Agent 选择、启动命令、监督策略与提示词模板。</p>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ── Workspace C ── -->
+    <div class="workspace">
+      <div class="ws-header">工作区 C</div>
+      <div class="ws-body">
+
+        <div class="node agent">
+          <div class="node-head">Agent 进程 <span class="pill agent">pid=agent-C</span></div>
+          <p>通过提示词接收目标 PID、预期行为、异常处理与代码修改边界。</p>
+          <div class="tags">
+            <span class="tag">监控运行</span>
+            <span class="tag">分析日志</span>
+            <span class="tag">修复脚本</span>
+            <span class="tag prompt-tag">提示词驱动</span>
+          </div>
+        </div>
+
+        <div style="text-align:center; font-size:10.5px; font-weight:700; color:#dc2626; padding:2px 0;">
+          ▲ 轮询 Agent 状态 (IPC) &nbsp;|&nbsp; 发送继续工作提示词 ▼
+        </div>
+
+        <div class="node supervisor">
+          <div class="node-head">监督脚本 <span class="pill supervisor">pid=watch-C</span></div>
+          <p>只和 Agent 进程通信，不直接理解业务代码；职责是确保 Agent 始终处于有效工作状态。</p>
+          <div class="poll-badge">轮询间隔: 45s（用户可配）</div>
+        </div>
+
+        <div style="text-align:center; font-size:10.5px; font-weight:700; color:#d97706; padding:2px 0;">
+          ▼ 提示词通道：Agent 监控脚本 PID（非代码连接） ▼
+        </div>
+
+        <div class="node script">
+          <div class="node-head">启动脚本 <span class="pill script">pid=script-C</span></div>
+          <p>Agent 根据 PID 与提示词跟踪启动脚本、子任务、日志和运行结果。</p>
+        </div>
+
+        <div class="node config">
+          <div class="node-head">结果返回 <span class="pill pid">pid=result-C</span></div>
+          <p>状态、错误、修复结果或下一步提示通过 PID 关联回监督脚本或用户入口。</p>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ↓ Results arrow -->
+  <div style="text-align:center; padding:16px 0 4px;">
+    <span style="font-size:13px; font-weight:700; color:var(--pid);">▼ 运行状态 / 结果通过 PID 回写至协调层 ▼</span>
+  </div>
+
+  <!-- ═══ PID COORDINATION LAYER ═══ -->
+  <div class="section-label">PID 协调层</div>
+  <div class="pid-bus">
+    <h3>所有组件通过进程 ID 建立协作关系</h3>
+    <p class="bus-sub">Agent ⇄ 监督脚本 ⇄ 启动脚本 均以 PID 为纽带；提示词发送、结果返回均通过 PID 关联</p>
+    <div class="pid-bus-grid">
+      <div class="bus-item">
+        <strong>Agent PID</strong>
+        接收监督脚本轮询与继续工作提示词；持有目标脚本 PID 进行持续监控。
+      </div>
+      <div class="bus-item">
+        <strong>启动脚本 PID</strong>
+        启动命令生成（如 <code>python app.py —pid=xxx</code>），是 Agent 监控的核心目标进程。
+      </div>
+      <div class="bus-item">
+        <strong>监督脚本 PID</strong>
+        持有自身 PID；通过 Agent PID 发送轮询 + 提示词；接收结果回传。
+      </div>
+      <div class="bus-item">
+        <strong>并发任务 PID</strong>
+        多线程 / 子进程各自注册 PID，Agent 可逐一追踪与控制。
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ NOTES ═══ -->
+  <div class="notes">
+    <div class="note">
+      <h4>启动顺序</h4>
+      <p>用户选择工作区与 Agent → 设置或生成 PID → 执行启动命令（如 <code>python app.py —pid=xxx</code>）→ Agent 启动并接收提示词 → 监督脚本按配置间隔开始轮询。</p>
+    </div>
+    <div class="note">
+      <h4>监督逻辑（轮询制）</h4>
+      <p>监督脚本每 N 秒（用户可配）检查 Agent 进程是否处于工作状态。若 Agent 空闲或停止，则通过 Agent PID 发送"继续监控目标脚本 PID"的提示词，确保 Agent 持续工作。</p>
+    </div>
+    <div class="note">
+      <h4>提示词边界 — 非代码连接</h4>
+      <p>Agent 与启动脚本之间<strong>不是代码接口调用</strong>。Agent 通过提示词获知目标脚本的 PID、预期行为与监控要求。所有交互（定位、监控、修改、结果回传）均走提示词通道。</p>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
