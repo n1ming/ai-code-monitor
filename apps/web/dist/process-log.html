@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Process Log</title>
+    <style>
+      :root {
+        color: #d7e1ee;
+        background: #0f1720;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; background: #0f1720; }
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 14px 18px;
+        border-bottom: 1px solid #263244;
+        background: rgba(15, 23, 32, .94);
+      }
+      h1 { margin: 0; font-size: 15px; }
+      .meta { margin-top: 5px; color: #8da2bc; font-size: 12px; overflow-wrap: anywhere; }
+      .controls {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      label {
+        display: grid;
+        gap: 4px;
+        color: #8da2bc;
+        font-size: 11px;
+      }
+      input, select {
+        min-height: 32px;
+        border: 1px solid #344258;
+        border-radius: 6px;
+        color: #d7e1ee;
+        background: #151f2c;
+        font: inherit;
+      }
+      input, select { width: 132px; padding: 0 8px; }
+      input[type="number"] { width: 86px; }
+      input[type="search"] { width: 180px; }
+      main { padding: 14px 18px 24px; }
+      .terminal {
+        min-height: calc(100vh - 96px);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font-size: 12px;
+        line-height: 1.65;
+      }
+      .line.error { color: #ff7b7b; }
+      .line.debug { color: #76a9ff; }
+      .line.success { color: #5fe08f; }
+      .line.warn { color: #ffd166; }
+      .line.info { color: #f3f7fb; }
+      @media (max-width: 900px) {
+        header {
+          align-items: stretch;
+          flex-direction: column;
+        }
+        .controls { justify-content: flex-start; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1 id="title">Process Log</h1>
+        <div class="meta" id="meta"></div>
+      </div>
+      <div class="controls">
+        <label>
+          范围
+          <select id="roleFilter">
+            <option value="">全部</option>
+            <option value="app">App</option>
+            <option value="agent">Agent</option>
+            <option value="watch">Monitor</option>
+          </select>
+        </label>
+        <label>
+          等级
+          <select id="levelFilter">
+            <option value="">全部</option>
+            <option value="INFO">INFO</option>
+            <option value="DEBUG">DEBUG</option>
+            <option value="SUCCESS">SUCCESS</option>
+            <option value="WARN">WARN</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+        </label>
+        <label>
+          开始时间
+          <input id="startTime" type="datetime-local" />
+        </label>
+        <label>
+          结束时间
+          <input id="endTime" type="datetime-local" />
+        </label>
+        <label>
+          关键词
+          <input id="keyword" type="search" placeholder="搜索日志" />
+        </label>
+        <label>
+          行数
+          <input id="limit" type="number" min="1" max="5000" value="1000" />
+        </label>
+      </div>
+    </header>
+    <main>
+      <div class="terminal" id="terminal">Loading...</div>
+    </main>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const workspaceId = params.get("workspace_id") || "";
+      const processId = params.get("process_id") || "";
+      const role = params.get("role") || "agent";
+      const displayRole = role === "watch" || role === "supervisor"
+        ? "Monitor"
+        : role === "app"
+          ? "App"
+          : "Agent";
+      const roleForApi = role === "monitor" || role === "supervisor" ? "watch" : role;
+      const title = document.getElementById("title");
+      const meta = document.getElementById("meta");
+      const terminal = document.getElementById("terminal");
+      const limitInput = document.getElementById("limit");
+      const roleFilter = document.getElementById("roleFilter");
+      const levelFilter = document.getElementById("levelFilter");
+      const startTime = document.getElementById("startTime");
+      const endTime = document.getElementById("endTime");
+      const keyword = document.getElementById("keyword");
+      let filterTimer = null;
+
+      title.textContent = `${displayRole} 日志 - ${processId}`;
+      meta.textContent = workspaceId;
+      roleFilter.value = roleForApi === "supervisor" ? "watch" : roleForApi;
+      if (params.has("limit")) limitInput.value = params.get("limit") || "1000";
+
+      function cleanLogLine(line) {
+        return String(line)
+          .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)?/g, "")
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+          .replace(/\x1b/g, "")
+          .replace(/^\s*\d{1,4}\s+(?=\S)/, "")
+          .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+          .trim();
+      }
+
+      function lineClass(line) {
+        const upper = line.toUpperCase();
+        if (upper.includes(" ERROR ")) return "line error";
+        if (upper.includes(" DEBUG ")) return "line debug";
+        if (upper.includes(" SUCCESS ")) return "line success";
+        if (upper.includes(" WARN ") || upper.includes(" WARNING ")) return "line warn";
+        return "line info";
+      }
+
+      async function loadLogs() {
+        const shouldStickToBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 40;
+        if (!terminal.dataset.loaded) terminal.textContent = "Loading...";
+        const limit = limitInput.value || "1000";
+        const query = new URLSearchParams({ limit });
+        if (roleFilter.value) query.set("role", roleFilter.value);
+        if (levelFilter.value) query.set("level", levelFilter.value);
+        if (startTime.value) query.set("start", startTime.value);
+        if (endTime.value) query.set("end", endTime.value);
+        if (keyword.value.trim()) query.set("keyword", keyword.value.trim());
+        const url = `/api/workspaces/${encodeURIComponent(workspaceId)}/process-logs?${query}`;
+        const response = await fetch(url);
+        if (!response.ok) {
+          terminal.textContent = await response.text();
+          return;
+        }
+        const data = await response.json();
+        terminal.innerHTML = "";
+        for (const item of data.items) {
+          const line = cleanLogLine(item.content);
+          if (!line) continue;
+          const div = document.createElement("div");
+          div.className = lineClass(line);
+          div.textContent = line;
+          terminal.appendChild(div);
+        }
+        terminal.dataset.loaded = "true";
+        if (shouldStickToBottom) window.scrollTo(0, document.body.scrollHeight);
+      }
+
+      function scheduleLoad() {
+        window.clearTimeout(filterTimer);
+        filterTimer = window.setTimeout(() => void loadLogs(), 250);
+      }
+
+      async function loadSettings() {
+        try {
+          const response = await fetch("/api/settings/logs");
+          if (!response.ok) return;
+          const data = await response.json();
+          if (data.default_log_limit && !params.has("limit")) {
+            limitInput.value = String(data.default_log_limit);
+          }
+        } catch {
+          // Keep static defaults when settings are unavailable.
+        }
+      }
+
+      for (const element of [limitInput, roleFilter, levelFilter, startTime, endTime, keyword]) {
+        element.addEventListener("input", scheduleLoad);
+        element.addEventListener("change", scheduleLoad);
+      }
+      void (async () => {
+        await loadSettings();
+        await loadLogs();
+      })();
+      window.setInterval(() => void loadLogs(), 3000);
+    </script>
+  </body>
+</html>
