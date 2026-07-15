@@ -50,6 +50,37 @@
       input, select { width: 132px; padding: 0 8px; }
       input[type="number"] { width: 86px; }
       input[type="search"] { width: 180px; }
+      input[type="date"] { width: 142px; }
+      input[type="time"] { width: 112px; }
+      input[type="checkbox"] { width: 16px; min-height: 16px; }
+      input[type="date"] {
+        cursor: pointer;
+        position: relative;
+        appearance: none;
+        -webkit-appearance: none;
+      }
+      input[type="date"]::-webkit-calendar-picker-indicator {
+        opacity: 0;
+        width: 100%;
+        height: 100%;
+        position: absolute;
+        inset: 0;
+        cursor: pointer;
+      }
+      .date-trigger {
+        cursor: pointer;
+      }
+      label.inline-check {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        min-height: 32px;
+        padding-top: 16px;
+      }
+      .datetime-pair {
+        display: flex;
+        gap: 6px;
+      }
       main { padding: 14px 18px 24px; }
       .terminal {
         min-height: calc(100vh - 96px);
@@ -95,17 +126,23 @@
             <option value="INFO">INFO</option>
             <option value="DEBUG">DEBUG</option>
             <option value="SUCCESS">SUCCESS</option>
-            <option value="WARN">WARN</option>
+            <option value="WARNING">WARNING</option>
             <option value="ERROR">ERROR</option>
           </select>
         </label>
-        <label>
-          开始时间
-          <input id="startTime" type="datetime-local" />
+        <label class="date-trigger" data-date-target="startDate">
+          开始日期
+          <span class="datetime-pair">
+            <input id="startDate" type="date" />
+            <input id="startTime" type="time" step="1" />
+          </span>
         </label>
-        <label>
-          结束时间
-          <input id="endTime" type="datetime-local" />
+        <label class="date-trigger" data-date-target="endDate">
+          结束日期
+          <span class="datetime-pair">
+            <input id="endDate" type="date" />
+            <input id="endTime" type="time" step="1" />
+          </span>
         </label>
         <label>
           关键词
@@ -114,6 +151,10 @@
         <label>
           行数
           <input id="limit" type="number" min="1" max="5000" value="1000" />
+        </label>
+        <label class="inline-check">
+          <input id="includeArchive" type="checkbox" />
+          归档
         </label>
       </div>
     </header>
@@ -137,9 +178,12 @@
       const limitInput = document.getElementById("limit");
       const roleFilter = document.getElementById("roleFilter");
       const levelFilter = document.getElementById("levelFilter");
+      const startDate = document.getElementById("startDate");
       const startTime = document.getElementById("startTime");
+      const endDate = document.getElementById("endDate");
       const endTime = document.getElementById("endTime");
       const keyword = document.getElementById("keyword");
+      const includeArchive = document.getElementById("includeArchive");
       let filterTimer = null;
 
       title.textContent = `${displayRole} 日志 - ${processId}`;
@@ -147,12 +191,23 @@
       roleFilter.value = roleForApi === "supervisor" ? "watch" : roleForApi;
       if (params.has("limit")) limitInput.value = params.get("limit") || "1000";
 
+      function applyDateTimeParam(name, dateInput, timeInput) {
+        const value = params.get(name);
+        if (!value) return;
+        const [datePart, timePart = ""] = value.split("T");
+        if (datePart) dateInput.value = datePart;
+        if (timePart) timeInput.value = timePart.slice(0, 8);
+      }
+
+      applyDateTimeParam("start", startDate, startTime);
+      applyDateTimeParam("end", endDate, endTime);
+
       function cleanLogLine(line) {
         return String(line)
           .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)?/g, "")
           .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
           .replace(/\x1b/g, "")
-          .replace(/^\s*\d{1,4}\s+(?=\S)/, "")
+          .replace(/^\s*\d{1,3}(?:\s+|(?=[^\d\s]))/, "")
           .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
           .trim();
       }
@@ -166,16 +221,27 @@
         return "line info";
       }
 
+      function combineDateTime(dateInput, timeInput, boundary) {
+        if (!dateInput.value) return "";
+        const fallback = boundary === "end" ? "23:59:59" : "00:00:00";
+        const time = timeInput.value || fallback;
+        return `${dateInput.value}T${time}`;
+      }
+
       async function loadLogs() {
         const shouldStickToBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 40;
         if (!terminal.dataset.loaded) terminal.textContent = "Loading...";
         const limit = limitInput.value || "1000";
         const query = new URLSearchParams({ limit });
+        if (processId) query.set("process_id", processId);
         if (roleFilter.value) query.set("role", roleFilter.value);
         if (levelFilter.value) query.set("level", levelFilter.value);
-        if (startTime.value) query.set("start", startTime.value);
-        if (endTime.value) query.set("end", endTime.value);
+        const startValue = combineDateTime(startDate, startTime, "start");
+        const endValue = combineDateTime(endDate, endTime, "end");
+        if (startValue) query.set("start", startValue);
+        if (endValue) query.set("end", endValue);
         if (keyword.value.trim()) query.set("keyword", keyword.value.trim());
+        query.set("include_archive", includeArchive.checked ? "true" : "false");
         const url = `/api/workspaces/${encodeURIComponent(workspaceId)}/process-logs?${query}`;
         const response = await fetch(url);
         if (!response.ok) {
@@ -209,12 +275,38 @@
           if (data.default_log_limit && !params.has("limit")) {
             limitInput.value = String(data.default_log_limit);
           }
+          if (typeof data.search_archives_by_default === "boolean" && !params.has("include_archive")) {
+            includeArchive.checked = data.search_archives_by_default;
+          }
         } catch {
           // Keep static defaults when settings are unavailable.
         }
       }
 
-      for (const element of [limitInput, roleFilter, levelFilter, startTime, endTime, keyword]) {
+      if (params.has("include_archive")) {
+        includeArchive.checked = params.get("include_archive") !== "false" && params.get("include_archive") !== "0";
+      }
+
+      function openDatePicker(input) {
+        input.focus();
+        if (typeof input.showPicker === "function") {
+          try {
+            input.showPicker();
+          } catch {
+            // Some browsers only allow showPicker from the direct input event.
+          }
+        }
+      }
+
+      for (const trigger of document.querySelectorAll(".date-trigger")) {
+        trigger.addEventListener("click", (event) => {
+          if (event.target && event.target.matches("input[type='time']")) return;
+          const input = document.getElementById(trigger.dataset.dateTarget);
+          if (input) openDatePicker(input);
+        });
+      }
+
+      for (const element of [limitInput, roleFilter, levelFilter, startDate, startTime, endDate, endTime, keyword, includeArchive]) {
         element.addEventListener("input", scheduleLoad);
         element.addEventListener("change", scheduleLoad);
       }

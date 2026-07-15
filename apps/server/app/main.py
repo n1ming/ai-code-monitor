@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -205,6 +206,7 @@ class RuntimeLogListResponse(BaseModel):
     storage_available: bool
     items: list[RuntimeLogInfo]
     warning: str | None = None
+    archive_searched: bool = False
 
 
 class LogSettingsPayload(BaseModel):
@@ -212,6 +214,7 @@ class LogSettingsPayload(BaseModel):
     retention_days: int = Field(default=30, ge=1, le=3650)
     default_log_limit: int = Field(default=1000, ge=10, le=5000)
     sync_tail_lines: int = Field(default=5000, ge=100, le=50000)
+    search_archives_by_default: bool = True
 
 
 class LogSettingsInfo(LogSettingsPayload):
@@ -330,6 +333,7 @@ class LogSettings(Base):
     retention_days: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
     default_log_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=1000)
     sync_tail_lines: Mapped[int] = mapped_column(Integer, nullable=False, default=5000)
+    search_archives_by_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     updated_at: Mapped[object] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
@@ -362,6 +366,7 @@ def startup() -> None:
     try:
         Base.metadata.create_all(bind=engine)
         _ensure_runtime_log_schema()
+        _cleanup_terminal_noise_logs()
     except SQLAlchemyError:
         # Database health is surfaced through API responses so the UI can remain usable.
         pass
@@ -389,6 +394,7 @@ def _default_log_settings() -> LogSettingsPayload:
         retention_days=LOG_RETENTION_DAYS,
         default_log_limit=int(os.getenv("AICM_DEFAULT_LOG_LIMIT", "1000")),
         sync_tail_lines=int(os.getenv("AICM_LOG_SYNC_TAIL_LINES", "5000")),
+        search_archives_by_default=os.getenv("AICM_SEARCH_ARCHIVES_BY_DEFAULT", "true").lower() not in {"0", "false", "no"},
     )
 
 
@@ -403,6 +409,7 @@ def _get_log_settings(db: Session) -> LogSettings:
         retention_days=defaults.retention_days,
         default_log_limit=defaults.default_log_limit,
         sync_tail_lines=defaults.sync_tail_lines,
+        search_archives_by_default=defaults.search_archives_by_default,
     )
     db.add(row)
     db.flush()
@@ -415,6 +422,7 @@ def _log_settings_to_info(row: LogSettings, storage_available: bool = True, warn
         retention_days=row.retention_days,
         default_log_limit=row.default_log_limit,
         sync_tail_lines=row.sync_tail_lines,
+        search_archives_by_default=row.search_archives_by_default,
         storage_available=storage_available,
         warning=warning,
     )
@@ -433,6 +441,7 @@ def _ensure_runtime_log_schema() -> None:
         "CREATE INDEX ix_runtime_logs_workspace_role_time ON runtime_logs (workspace_id, role, occurred_at)",
         "CREATE INDEX ix_runtime_logs_workspace_level_time ON runtime_logs (workspace_id, level, occurred_at)",
         "CREATE INDEX ix_runtime_logs_process_time ON runtime_logs (process_id, occurred_at)",
+        "ALTER TABLE log_settings ADD COLUMN search_archives_by_default BOOLEAN NOT NULL DEFAULT TRUE",
     ]
     with engine.begin() as connection:
         for statement in statements:
@@ -440,6 +449,31 @@ def _ensure_runtime_log_schema() -> None:
                 connection.execute(text(statement))
             except SQLAlchemyError:
                 continue
+
+
+def _cleanup_terminal_noise_logs() -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                DELETE FROM runtime_logs
+                WHERE log_type IN ('stdout', 'stderr')
+                  AND content REGEXP '^[0-9]{1,3}([^0-9]|$)'
+                  AND content NOT REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                DELETE FROM runtime_logs
+                WHERE role = 'agent'
+                  AND log_type IN ('stdout', 'stderr')
+                  AND content NOT REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}'
+                  AND UPPER(content) NOT REGEXP '(^|[[:space:]])(ERROR|WARNING|WARN|DEBUG|SUCCESS|INFO)([[:space:]]|$)'
+                """
+            )
+        )
 
 
 def _normalize_process_id(process_id: str) -> str:
@@ -544,7 +578,7 @@ def _normalize_runtime_end(started_at: datetime, end_at: datetime) -> datetime:
 
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OSC_PATTERN = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)?")
-TUI_PREFIX_PATTERN = re.compile(r"^\s*\d{1,4}\s+")
+TUI_PREFIX_PATTERN = re.compile(r"^\s*\d{1,3}(?:\s+|(?=[^\d\s]))")
 
 
 def _strip_terminal_noise(line: str) -> str:
@@ -572,7 +606,7 @@ def _clean_log_lines(lines: list[str]) -> list[str]:
         line = _strip_terminal_noise(raw)
         if not line:
             continue
-        if len(line) <= 2 and not any(token in line for token in ("INFO", "DEBUG", "SUCCESS", "ERROR")):
+        if len(line) <= 2 and not any(token in line for token in ("INFO", "DEBUG", "SUCCESS", "ERROR", "WARN", "WARNING")):
             pending_chars.append(line)
             continue
         flush_pending()
@@ -581,12 +615,48 @@ def _clean_log_lines(lines: list[str]) -> list[str]:
     return cleaned
 
 
+def _clean_log_entries(entries: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    cleaned: list[tuple[int, str]] = []
+    pending_chars: list[str] = []
+    pending_line_number: int | None = None
+
+    def flush_pending() -> None:
+        nonlocal pending_chars, pending_line_number
+        if pending_chars:
+            text = "".join(pending_chars).strip()
+            if text:
+                cleaned.append((pending_line_number or entries[0][0], text))
+            pending_chars = []
+            pending_line_number = None
+
+    for line_number, raw in entries:
+        line = _strip_terminal_noise(raw)
+        if not line:
+            continue
+        if len(line) <= 2 and not any(token in line for token in ("INFO", "DEBUG", "SUCCESS", "ERROR", "WARN", "WARNING")):
+            if pending_line_number is None:
+                pending_line_number = line_number
+            pending_chars.append(line)
+            continue
+        flush_pending()
+        cleaned.append((line_number, line))
+    flush_pending()
+    return cleaned
+
+
 def _level_from_log_line(line: str) -> str:
     upper = line.upper()
-    for level in ("ERROR", "WARN", "WARNING", "DEBUG", "SUCCESS", "INFO"):
+    for level in ("ERROR", "WARNING", "WARN", "DEBUG", "SUCCESS", "INFO"):
         if f" {level} " in upper or upper.startswith(f"{level} "):
-            return "WARN" if level == "WARNING" else level
+            return "WARNING" if level == "WARN" else level
     return "INFO"
+
+
+def _line_has_log_signal(line: str) -> bool:
+    if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b", line):
+        return True
+    upper = line.upper()
+    return any(f" {level} " in upper or upper.startswith(f"{level} ") for level in ("ERROR", "WARN", "WARNING", "DEBUG", "SUCCESS", "INFO"))
 
 
 def _tail_file(path: Path, limit: int = 100) -> list[str]:
@@ -602,22 +672,21 @@ def _read_log_file_entries(path: Path, limit: int = 1000) -> list[tuple[int, str
     except OSError:
         return []
     start_line = max(1, len(raw_lines) - limit + 1)
-    entries: list[tuple[int, str]] = []
-    for line_number, raw in enumerate(raw_lines[-limit:], start=start_line):
-        cleaned = _strip_terminal_noise(raw.rstrip("\n"))
-        if cleaned:
-            entries.append((line_number, cleaned))
-    return entries
+    entries = [
+        (line_number, raw.rstrip("\n"))
+        for line_number, raw in enumerate(raw_lines[-limit:], start=start_line)
+    ]
+    return _clean_log_entries(entries)
 
 
 def _parse_log_timestamp(line: str) -> datetime:
     match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\b", line)
     if not match:
-        return datetime.now(timezone.utc)
+        return datetime.now()
     try:
-        return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
     except ValueError:
-        return datetime.now(timezone.utc)
+        return datetime.now()
 
 
 def _runtime_log_sources(workspace: Workspace, role: str | None = None) -> list[tuple[str, str, Path]]:
@@ -664,6 +733,8 @@ def _sync_workspace_logs_to_db_locked(db: Session, workspace: Workspace, role: s
         if not process_id:
             continue
         for line_number, line in _read_log_file_entries(path, limit):
+            if source_role == "agent" and source_type in {"stdout", "stderr"} and not _line_has_log_signal(line):
+                continue
             content_hash = _runtime_log_hash(workspace.workspace_id, process_id, source_role, source_type, path, line_number, line)
             db.execute(
                 text(
@@ -757,6 +828,163 @@ def _runtime_log_to_info(row: RuntimeLog) -> RuntimeLogInfo:
     )
 
 
+ARCHIVE_LINE_PATTERN = re.compile(
+    r"^(?P<occurred>\d{4}-\d{2}-\d{2}T[^\s]+)\s+"
+    r"(?P<level>\S+)\s+"
+    r"(?P<role>\S+)\s+"
+    r"(?P<process_id>\S+)\s+"
+    r"(?P<log_type>\S+)\s+"
+    r"(?P<content>.*)$"
+)
+
+
+def _parse_archive_datetime(value: str) -> datetime:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return datetime.now()
+    if parsed.tzinfo is not None:
+        return parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _archive_line_to_info(
+    workspace_id: str,
+    archive: LogArchive,
+    line: str,
+    fallback_index: int,
+) -> RuntimeLogInfo | None:
+    line = _strip_terminal_noise(line.rstrip("\n"))
+    if not line:
+        return None
+    match = ARCHIVE_LINE_PATTERN.match(line)
+    if match:
+        occurred_at = _parse_archive_datetime(match.group("occurred"))
+        level = match.group("level").upper()
+        role = match.group("role")
+        process_id = match.group("process_id")
+        log_type = match.group("log_type")
+        content = match.group("content")
+    else:
+        content = line
+        occurred_at = _parse_log_timestamp(content)
+        level = _level_from_log_line(content)
+        role = archive.role
+        process_id = archive.process_id
+        log_type = "archive"
+    stable_hash = hashlib.sha256(f"{archive.id}\0{fallback_index}\0{line}".encode("utf-8", errors="replace")).hexdigest()
+    log_id = -int(stable_hash[:12], 16)
+    occurred = occurred_at.isoformat()
+    return RuntimeLogInfo(
+        log_id=log_id,
+        workspace_id=workspace_id,
+        process_id=process_id,
+        role=role,
+        level=level,
+        log_type=log_type,
+        content=content,
+        occurred_at=occurred,
+        created_at=occurred,
+    )
+
+
+def _runtime_log_info_time(item: RuntimeLogInfo) -> datetime:
+    try:
+        return _parse_archive_datetime(item.occurred_at)
+    except ValueError:
+        return datetime.min
+
+
+def _runtime_log_info_matches(
+    item: RuntimeLogInfo,
+    role: str | None,
+    process_id: str | None,
+    levels: set[str],
+    keyword: str | None,
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    if role and item.role != role:
+        return False
+    if process_id and item.process_id != process_id:
+        return False
+    if levels and item.level.upper() not in levels:
+        return False
+    if keyword and keyword.lower() not in item.content.lower():
+        return False
+    occurred_at = _runtime_log_info_time(item)
+    if start and occurred_at < start:
+        return False
+    if end and occurred_at > end:
+        return False
+    return True
+
+
+def _search_archived_runtime_logs(
+    db: Session,
+    workspace_id: str,
+    role: str | None,
+    process_id: str | None,
+    levels: set[str],
+    keyword: str | None,
+    start: datetime | None,
+    end: datetime | None,
+    limit: int,
+) -> list[RuntimeLogInfo]:
+    archive_query = select(LogArchive).where(LogArchive.workspace_id == workspace_id)
+    if role:
+        archive_query = archive_query.where(LogArchive.role == role)
+    if process_id:
+        archive_query = archive_query.where(LogArchive.process_id == process_id)
+    if start:
+        archive_query = archive_query.where(LogArchive.archive_date >= start.date())
+    if end:
+        archive_query = archive_query.where(LogArchive.archive_date <= end.date())
+
+    archives = db.scalars(
+        archive_query.order_by(LogArchive.archive_date.desc(), LogArchive.id.desc())
+    ).all()
+    matches: list[RuntimeLogInfo] = []
+    for archive in archives:
+        path = Path(archive.file_path).expanduser()
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rt", encoding="utf-8", errors="replace") as file:  # type: ignore[arg-type]
+                for index, raw_line in enumerate(file, start=1):
+                    item = _archive_line_to_info(workspace_id, archive, raw_line, index)
+                    if item is None:
+                        continue
+                    if _runtime_log_info_matches(item, role, process_id, levels, keyword, start, end):
+                        matches.append(item)
+        except OSError:
+            continue
+
+    matches.sort(key=lambda item: (_runtime_log_info_time(item), item.log_id), reverse=True)
+    return matches[:limit]
+
+
+def _dashboard_log_line(row: RuntimeLog) -> str:
+    if isinstance(row.occurred_at, datetime):
+        occurred_at = row.occurred_at.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        occurred_at = str(row.occurred_at)
+    level = (row.level or "INFO").upper()
+    object_id = row.process_id or row.role or "unknown"
+    content = _strip_terminal_noise(row.content or "")
+    content = re.sub(
+        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+(ERROR|WARNING|WARN|DEBUG|SUCCESS|INFO)\s*",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    ).strip()
+    return f"{occurred_at} {level} {object_id} {content}".strip()
+
+
 def _workspace_logs(db: Session, workspace: Workspace, limit: int = 100) -> list[str]:
     settings = _get_log_settings(db)
     _sync_workspace_logs_to_db(db, workspace, limit=max(limit, 300, settings.sync_tail_lines))
@@ -769,7 +997,7 @@ def _workspace_logs(db: Session, workspace: Workspace, limit: int = 100) -> list
     ).all()
     if not rows:
         return ["--:--:-- workspace loaded from database"]
-    return [row.content for row in reversed(rows)]
+    return [_dashboard_log_line(row) for row in reversed(rows)]
 
 
 def _pid_status(pid: int | None) -> tuple[str, str | None]:
@@ -932,6 +1160,7 @@ def _runtime_paths(root: Path) -> dict[str, Path]:
         "agent_stdin": bridge / "agent.stdin",
         "agent_pid": bridge / "agent.os_pid",
         "agent_heartbeat": bridge / "agent.heartbeat",
+        "initial_prompt_file": bridge / "initial-prompt.txt",
         "monitor_log": logs / "monitor.log",
         "agent_log": logs / "agent.log",
         "agent_out_log": logs / "agent.out.log",
@@ -1042,6 +1271,8 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
 
         COLORS = {{
             "ERROR": "\\033[31m",
+            "WARNING": "\\033[33m",
+            "WARN": "\\033[33m",
             "DEBUG": "\\033[34m",
             "SUCCESS": "\\033[32m",
             "INFO": "\\033[37m",
@@ -1113,7 +1344,7 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
 
 
         def start_app() -> int:
-            append_app_log("INFO", f"{{AGENT_PROCESS_ID}} launching app command: {{COMMAND}}")
+            append_app_log("INFO", f"{{PROCESS_ID}} 启动应用命令: {{COMMAND}}，触发方 agent process_id: {{AGENT_PROCESS_ID}}")
             output = APP_LOG.open("ab", buffering=0)
             process = subprocess.Popen(
                 COMMAND,
@@ -1127,26 +1358,26 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
             )
             time.sleep(1)
             if pid_alive(process.pid):
-                log("SUCCESS", f"应用进程已启动，OS PID: {{process.pid}}")
+                log("SUCCESS", f"应用进程已启动，app process_id: {{PROCESS_ID}}，OS PID: {{process.pid}}，启动命令: {{COMMAND}}")
                 write_runtime(process.pid, "running")
             else:
-                log("ERROR", f"应用进程启动后不可达，OS PID: {{process.pid}}")
+                log("ERROR", f"应用进程启动后不可达，app process_id: {{PROCESS_ID}}，OS PID: {{process.pid}}，启动命令: {{COMMAND}}")
                 write_runtime(process.pid, "exited")
             return process.pid
 
 
         def main() -> int:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
-            log("INFO", f"watchdog 启动，轮询间隔: {{POLL_SECONDS}}s")
+            log("INFO", f"应用 watchdog 启动，app process_id: {{PROCESS_ID}}，agent process_id: {{AGENT_PROCESS_ID}}，启动命令: {{COMMAND}}，轮询间隔: {{POLL_SECONDS}}s")
 
             runtime = read_runtime()
             current_pid = runtime.get("os_pid")
             if isinstance(current_pid, int) and pid_alive(current_pid):
-                log("DEBUG", f"复用现有应用进程，OS PID: {{current_pid}}")
+                log("DEBUG", f"复用现有应用进程，app process_id: {{PROCESS_ID}}，OS PID: {{current_pid}}，启动命令: {{COMMAND}}")
                 write_runtime(current_pid, "running")
             else:
                 if current_pid is not None:
-                    log("ERROR", f"runtime 中的应用 PID 不可用: {{current_pid}}，准备重启。")
+                    log("ERROR", f"runtime 中的应用 OS PID 不可用，app process_id: {{PROCESS_ID}}，OS PID: {{current_pid}}，准备重启。")
                 current_pid = start_app()
 
             while True:
@@ -1154,14 +1385,14 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
                 runtime = read_runtime()
                 runtime_pid = runtime.get("os_pid")
                 if not isinstance(runtime_pid, int):
-                    log("ERROR", "runtime 缺少有效 os_pid，准备重启应用。")
+                    log("ERROR", f"runtime 缺少有效 os_pid，app process_id: {{PROCESS_ID}}，启动命令: {{COMMAND}}，准备重启应用。")
                     current_pid = start_app()
                 elif pid_alive(runtime_pid):
                     current_pid = runtime_pid
                     write_runtime(current_pid, "running")
-                    log("DEBUG", f"应用健康检查通过，OS PID: {{current_pid}}")
+                    log("DEBUG", f"应用健康检查通过，app process_id: {{PROCESS_ID}}，OS PID: {{current_pid}}，启动命令: {{COMMAND}}")
                 else:
-                    log("ERROR", f"应用进程已退出，OS PID: {{runtime_pid}}，准备重启。")
+                    log("ERROR", f"应用进程已退出，app process_id: {{PROCESS_ID}}，OS PID: {{runtime_pid}}，启动命令: {{COMMAND}}，准备重启。")
                     current_pid = start_app()
                 time.sleep(POLL_SECONDS)
 
@@ -1217,28 +1448,40 @@ def _write_app_runtime_helpers(workspace: Workspace, db: Session) -> None:
     (root / "app_launcher.py").write_text(_app_launcher_source(), encoding="utf-8")
 
 
-def _build_initial_prompt(workspace: Workspace, process_ids: WorkspaceProcessIds, paths: dict[str, Path]) -> str:
+def _ai_edit_policy_text(workspace: Workspace) -> str:
     if workspace.ai_can_edit:
         custom_prompt = workspace.initial_prompt.strip()
+        restart_rule = (
+            "修改代码后必须立即进行验证：先记录你修改了哪些文件和原因，然后通过当前工作区的启动链路重启 App "
+            "（优先执行 python app_launcher.py，不要绕过 app_launcher.py 直接运行用户启动命令），"
+            "确认 .ai-code-monitor/app-runtime.json 写入新的真实 OS PID、启动命令和 running 状态，"
+            "再检查 app.out.log 是否出现重启后的新日志；如果验证失败，必须继续修复并再次重启测试，直到 App 正常运行。"
+        )
         if custom_prompt:
-            edit_policy = f"你在监控的过程中出现问题可以修改代码，{custom_prompt}"
-        else:
-            edit_policy = "你在监控的过程中出现问题可以修改代码。"
-    else:
-        edit_policy = "你在监控的过程中不能修改代码。"
+            return f"AI 修改代码权限：用户已允许你在监控过程中修改代码。用户关于 AI 修改代码的提示词是：{custom_prompt}。{restart_rule}"
+        return f"AI 修改代码权限：用户已允许你在监控过程中修改代码。{restart_rule}"
+    return "AI 修改代码权限：用户未允许你修改代码。你在监控过程中不能修改任何代码或项目文件，只能监控、分析、运行命令和写日志。"
+
+
+def _build_initial_prompt(workspace: Workspace, process_ids: WorkspaceProcessIds, paths: dict[str, Path]) -> str:
+    project_path = str(Path(workspace.path).expanduser().resolve())
+    edit_policy = _ai_edit_policy_text(workspace)
 
     return (
-        f"你是个智能脚本监控者，你开始监控【{workspace.name}】这里面的脚本，请你先阅读理解。"
-        f"你的第一步必须立即在项目根目录执行【python app_launcher.py】，不要等待用户确认，不要只阅读文件。"
+        f"你是个智能脚本监控者，你开始监控项目路径【{project_path}】。"
+        f"工作区名称是【{workspace.name}】，请先阅读理解这个目录里的脚本。"
+        f"你的第一步必须立即在项目根目录【{project_path}】执行【python app_launcher.py】，不要等待用户确认，不要只阅读文件。"
         f"app_launcher.py 会根据用户启动命令【{workspace.start_command}】后台启动项目，并写入 runtime。"
-        f"进程id是【{process_ids.app}】，你开始不断监控，{edit_policy}\n"
+        f"进程id是【{process_ids.app}】，你开始不断监控。\n"
+        f"{edit_policy}\n"
         f"不要直接执行【{workspace.start_command}】，必须通过【python app_launcher.py】启动。"
         f"启动后请检查 {paths['base'] / 'app-runtime.json'} 是否写入真实 OS PID、启动命令和状态。"
         "并且，你要保留记录日志的习惯，不仅是代码内部记录日志，你自己的操作也要记录日志。"
-        "日志格式为具体日期 + 日志等级 + 日志信息。日志等级使用 ERROR、DEBUG、SUCCESS、INFO；"
-        "错误是红色，调试是蓝色，成功是绿色，普通是白色。\n"
+        "日志格式为具体日期 + 日志等级 + 日志信息。日志等级使用 ERROR、WARNING、DEBUG、SUCCESS、INFO；"
+        "错误是红色，警告是黄色，调试是蓝色，成功是绿色，普通是白色。\n"
         f"你的逻辑 process_id 是【{process_ids.agent}】，监督脚本 process_id 是【{process_ids.watch}】。"
-        f"请把你的操作日志追加写入 {paths['agent_log']}，并定期更新心跳文件 {paths['agent_heartbeat']}。"
+        "请把你的操作日志追加写入项目目录下的 Agent 日志文件【.ai-code-monitor/logs/agent.log】，"
+        "并定期更新项目目录下的 Agent 心跳文件【.ai-code-monitor/bridge/agent.heartbeat】。"
     )
 
 
@@ -1246,7 +1489,24 @@ def _agent_runtime_command(workspace: Workspace) -> str:
     command = workspace.agent_command.strip()
     if command == "codex":
         sandbox = "workspace-write" if workspace.ai_can_edit else "read-only"
-        return f"codex --no-alt-screen -a never -s {sandbox}"
+        return f"codex --no-alt-screen -a never -s {sandbox} {{prompt}}"
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    has_prompt_placeholder = any("{prompt}" in part or "{prompt_file}" in part for part in parts)
+    if parts and Path(parts[0]).name == "claude" and not has_prompt_placeholder:
+        has_permission_mode = any(part == "--permission-mode" or part.startswith("--permission-mode=") for part in parts)
+        skips_permissions = any(
+            part in {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"}
+            for part in parts
+        )
+        if workspace.ai_can_edit and not has_permission_mode and not skips_permissions:
+            parts.append("--dangerously-skip-permissions")
+        if not workspace.ai_can_edit and not any(part.startswith("--disallowedTools") or part.startswith("--disallowed-tools") for part in parts):
+            parts.extend(["--disallowedTools", "Edit", "MultiEdit", "Write", "NotebookEdit"])
+        parts.append("{prompt}")
+        return shlex.join(parts)
     return command
 
 
@@ -1270,13 +1530,28 @@ def _monitor_script_source() -> str:
         AGENT_COMMAND = os.getenv("AICM_AGENT_COMMAND", "codex")
         AGENT_PID_FILE = Path(os.getenv("AICM_AGENT_PID_FILE", ".ai-code-monitor/bridge/agent.os_pid"))
         AGENT_HEARTBEAT = Path(os.getenv("AICM_AGENT_HEARTBEAT", ".ai-code-monitor/bridge/agent.heartbeat"))
+        INITIAL_PROMPT_FILE = Path(os.getenv("AICM_INITIAL_PROMPT_FILE", ".ai-code-monitor/bridge/initial-prompt.txt"))
         MONITOR_LOG = Path(os.getenv("AICM_MONITOR_LOG", ".ai-code-monitor/logs/monitor.log"))
+        AGENT_LOG = Path(os.getenv("AICM_AGENT_LOG", ".ai-code-monitor/logs/agent.log"))
         AGENT_OUT_LOG = Path(os.getenv("AICM_AGENT_OUT_LOG", ".ai-code-monitor/logs/agent.out.log"))
         APP_RUNTIME_FILE = Path(os.getenv("AICM_APP_RUNTIME_FILE", ".ai-code-monitor/app-runtime.json"))
         APP_LOG_FILE = Path(os.getenv("AICM_APP_LOG_FILE", ".ai-code-monitor/logs/app.out.log"))
         APP_STALE_SECONDS = max(POLL_SECONDS * 6, int(os.getenv("AICM_APP_STALE_SECONDS", "60")))
         INITIAL_PROMPT = os.getenv("AICM_INITIAL_PROMPT", "")
+        AI_EDIT_POLICY = os.getenv("AICM_AI_EDIT_POLICY", "")
+        AGENT_PROCESS_ID = os.getenv("AICM_AGENT_PROCESS_ID", "agent")
+        MONITOR_PROCESS_ID = os.getenv("AICM_MONITOR_PROCESS_ID", "monitor")
         RUNNING = True
+
+        COLORS = {
+            "ERROR": "\033[31m",
+            "WARNING": "\033[33m",
+            "WARN": "\033[33m",
+            "DEBUG": "\033[34m",
+            "SUCCESS": "\033[32m",
+            "INFO": "\033[37m",
+        }
+        RESET = "\033[0m"
 
         def log(level: str, message: str) -> None:
             MONITOR_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -1285,6 +1560,19 @@ def _monitor_script_source() -> str:
             line = f"{now} {level} {message}"
             with MONITOR_LOG.open("a", encoding="utf-8") as file:
                 file.write(f"{line}\n")
+
+
+        def agent_event(level: str, message: str) -> None:
+            AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            level = level.upper()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            color = COLORS.get(level, COLORS["INFO"])
+            line = f"{color}{now} {level} SYSTEM {MONITOR_PROCESS_ID}->{AGENT_PROCESS_ID} {message}{RESET}"
+            try:
+                with AGENT_LOG.open("a", encoding="utf-8") as file:
+                    file.write(f"{line}\n")
+            except OSError as exc:
+                log("ERROR", f"写入 Agent 系统事件日志失败: {exc}")
 
 
         def mark_heartbeat() -> None:
@@ -1301,19 +1589,38 @@ def _monitor_script_source() -> str:
                 log("ERROR", f"写入 Agent 输出日志失败: {exc}")
 
 
-        def is_codex_command() -> bool:
-            command = AGENT_COMMAND.strip()
-            return command == "codex" or command.startswith("codex ")
+        def prompt_for_log(message: str) -> str:
+            return message.replace(chr(13), "\\r").replace(chr(10), "\\n")
 
 
-        def start_agent(initial_prompt: str = "") -> tuple[subprocess.Popen[bytes], int]:
+        def append_policy(message: str) -> str:
+            if not AI_EDIT_POLICY:
+                return message
+            return f"{message.rstrip()}\n{AI_EDIT_POLICY}"
+
+
+        def render_command_part(part: str, initial_prompt: str) -> str:
+            return (
+                part.replace("{prompt}", initial_prompt)
+                .replace("{prompt_file}", str(INITIAL_PROMPT_FILE))
+                .replace("{project_path}", str(Path.cwd()))
+                .replace("{workspace_name}", WORKSPACE_NAME)
+            )
+
+
+        def build_agent_command(initial_prompt: str) -> tuple[object, bool, bool]:
+            parts = shlex.split(AGENT_COMMAND)
+            prompt_in_command = any("{prompt}" in part or "{prompt_file}" in part for part in parts)
+            if prompt_in_command:
+                return [render_command_part(part, initial_prompt) for part in parts], False, True
+            return AGENT_COMMAND, True, False
+
+
+        def start_agent(initial_prompt: str = "") -> tuple[subprocess.Popen[bytes], int, bool]:
+            INITIAL_PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            INITIAL_PROMPT_FILE.write_text(initial_prompt, encoding="utf-8")
             master_fd, slave_fd = pty.openpty()
-            if is_codex_command() and initial_prompt:
-                command = shlex.split(AGENT_COMMAND) + [initial_prompt]
-                shell = False
-            else:
-                command = AGENT_COMMAND
-                shell = True
+            command, shell, prompt_in_argv = build_agent_command(initial_prompt)
             process = subprocess.Popen(
                 command,
                 cwd=str(Path.cwd()),
@@ -1329,7 +1636,8 @@ def _monitor_script_source() -> str:
             AGENT_PID_FILE.write_text(str(process.pid), encoding="utf-8")
             mark_heartbeat()
             log("SUCCESS", f"Agent 已通过 PTY 启动，OS PID: {process.pid}")
-            return process, master_fd
+            agent_event("SUCCESS", f"系统通过 PTY 启动 Agent，OS PID: {process.pid}，命令: {AGENT_COMMAND}")
+            return process, master_fd, prompt_in_argv
 
 
         def drain_agent_output(master_fd: int) -> None:
@@ -1351,7 +1659,10 @@ def _monitor_script_source() -> str:
                 os.write(master_fd, (message.rstrip() + "\r").encode("utf-8"))
             except OSError as exc:
                 log("ERROR", f"发送提示词失败: {exc}")
+                agent_event("ERROR", f"系统向 Agent 发送提示词失败: {exc}")
                 return False
+            log("INFO", f"发送提示词给 Agent: {prompt_for_log(message)}")
+            agent_event("INFO", f"系统向 Agent 发送提示词: {prompt_for_log(message)}")
             return True
 
 
@@ -1410,13 +1721,18 @@ def _monitor_script_source() -> str:
             signal.signal(signal.SIGINT, handle_stop)
             signal.signal(signal.SIGTERM, handle_stop)
             log("INFO", f"监督脚本启动，工作区: {WORKSPACE_NAME}，轮询间隔: {POLL_SECONDS}s")
-            agent_process, master_fd = start_agent(INITIAL_PROMPT)
+            agent_event("INFO", f"系统监督脚本启动，工作区: {WORKSPACE_NAME}，轮询间隔: {POLL_SECONDS}s")
+            agent_process, master_fd, prompt_in_argv = start_agent(INITIAL_PROMPT)
             time.sleep(1.2)
             drain_agent_output(master_fd)
-            if is_codex_command():
+            if prompt_in_argv:
+                log("INFO", f"发送提示词给 Agent（启动参数）: {prompt_for_log(INITIAL_PROMPT)}")
+                agent_event("INFO", f"系统已把初始化提示词作为 Agent 启动参数传入: {prompt_for_log(INITIAL_PROMPT)}")
                 log("SUCCESS", f"初始化提示词已作为启动参数交给 Agent，OS PID: {agent_process.pid}")
+                agent_event("SUCCESS", f"初始化提示词已交给 Agent，OS PID: {agent_process.pid}")
             elif send_to_agent(master_fd, INITIAL_PROMPT):
                 log("SUCCESS", f"初始化提示词已发送给 Agent，OS PID: {agent_process.pid}")
+                agent_event("SUCCESS", f"初始化提示词已通过 PTY 发送给 Agent，OS PID: {agent_process.pid}")
 
             next_poll_at = time.time() + POLL_SECONDS
             while RUNNING:
@@ -1424,15 +1740,19 @@ def _monitor_script_source() -> str:
 
                 if agent_process.poll() is not None:
                     log("ERROR", f"Agent 进程已退出，退出码: {agent_process.returncode}，准备重启。")
+                    agent_event("ERROR", f"系统检测到 Agent 进程退出，退出码: {agent_process.returncode}，准备重启。")
                     try:
                         os.close(master_fd)
                     except OSError:
                         pass
-                    agent_process, master_fd = start_agent(INITIAL_PROMPT)
+                    agent_process, master_fd, prompt_in_argv = start_agent(INITIAL_PROMPT)
                     time.sleep(1.2)
                     drain_agent_output(master_fd)
-                    if is_codex_command():
+                    if prompt_in_argv:
+                        log("INFO", f"发送提示词给 Agent（重启参数）: {prompt_for_log(INITIAL_PROMPT)}")
+                        agent_event("INFO", f"系统已把初始化提示词作为 Agent 重启参数传入: {prompt_for_log(INITIAL_PROMPT)}")
                         log("SUCCESS", f"初始化提示词已作为重启参数交给 Agent，OS PID: {agent_process.pid}")
+                        agent_event("SUCCESS", f"Agent 已重启并接收初始化提示词，OS PID: {agent_process.pid}")
                     else:
                         send_to_agent(master_fd, INITIAL_PROMPT)
                     next_poll_at = time.time() + POLL_SECONDS
@@ -1446,10 +1766,13 @@ def _monitor_script_source() -> str:
                             "请立即检查启动脚本是否真实运行。如果没有运行，请重新执行启动命令，"
                             "把新的 OS PID 写入 app-runtime.json，并把输出继续追加到 app.out.log。"
                         )
+                        prompt = append_policy(prompt)
                         if send_to_agent(master_fd, prompt):
                             log("ERROR", f"检测到 App 异常，已提示 Agent 修复: {issue}")
-                    elif heartbeat_stale() and send_to_agent(master_fd, "继续"):
+                            agent_event("ERROR", f"系统检测到 App 异常并要求 Agent 处理: {issue}")
+                    elif heartbeat_stale() and send_to_agent(master_fd, append_policy("继续")):
                         log("INFO", "Agent 心跳过期，已发送提示词: 继续")
+                        agent_event("INFO", "系统检测到 Agent 心跳过期，已发送继续提示词。")
                     elif not heartbeat_stale():
                         log("DEBUG", "Agent 心跳正常。")
                     next_poll_at = time.time() + POLL_SECONDS
@@ -1457,6 +1780,7 @@ def _monitor_script_source() -> str:
                 time.sleep(0.25)
 
             log("INFO", "监督脚本正在停止 Agent。")
+            agent_event("INFO", "系统监督脚本正在停止 Agent。")
             try:
                 agent_process.terminate()
             except OSError:
@@ -1637,11 +1961,16 @@ def _start_workspace_processes(db: Session, workspace: Workspace) -> None:
         "AICM_AGENT_PID_FILE": str(paths["agent_pid"]),
         "AICM_AGENT_STDIN": str(paths["agent_stdin"]),
         "AICM_AGENT_HEARTBEAT": str(paths["agent_heartbeat"]),
+        "AICM_INITIAL_PROMPT_FILE": str(paths["initial_prompt_file"]),
         "AICM_MONITOR_LOG": str(paths["monitor_log"]),
+        "AICM_AGENT_LOG": str(paths["agent_log"]),
         "AICM_AGENT_OUT_LOG": str(paths["agent_out_log"]),
         "AICM_APP_RUNTIME_FILE": str(paths["base"] / "app-runtime.json"),
         "AICM_APP_LOG_FILE": str(paths["logs"] / "app.out.log"),
         "AICM_INITIAL_PROMPT": initial_prompt,
+        "AICM_AI_EDIT_POLICY": _ai_edit_policy_text(workspace),
+        "AICM_AGENT_PROCESS_ID": process_ids.agent,
+        "AICM_MONITOR_PROCESS_ID": process_ids.watch,
     }
     if codex_home is not None:
         monitor_env["CODEX_HOME"] = str(codex_home)
@@ -1883,6 +2212,7 @@ def update_log_settings(payload: LogSettingsPayload, db: Session = Depends(get_d
     row.retention_days = payload.retention_days
     row.default_log_limit = payload.default_log_limit
     row.sync_tail_lines = payload.sync_tail_lines
+    row.search_archives_by_default = payload.search_archives_by_default
     db.commit()
     db.refresh(row)
     return _log_settings_to_info(row)
@@ -2117,6 +2447,7 @@ def get_workspace_process_logs(
     keyword: str | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
+    include_archive: bool | None = None,
     limit: Annotated[int, Query(ge=1, le=5000)] = 1000,
     db: Session = Depends(get_db),
 ) -> RuntimeLogListResponse:
@@ -2141,8 +2472,9 @@ def get_workspace_process_logs(
         query = query.where(RuntimeLog.role == normalized_role)
     if process_id:
         query = query.where(RuntimeLog.process_id == process_id)
+    levels: set[str] = set()
     if level:
-        levels = [item.strip().upper() for item in level.split(",") if item.strip()]
+        levels = {item.strip().upper() for item in level.split(",") if item.strip()}
         if levels:
             query = query.where(RuntimeLog.level.in_(levels))
     if keyword:
@@ -2155,10 +2487,31 @@ def get_workspace_process_logs(
     rows = db.scalars(
         query.order_by(RuntimeLog.occurred_at.desc(), RuntimeLog.log_id.desc()).limit(limit)
     ).all()
+    hot_items = [_runtime_log_to_info(row) for row in rows]
+    should_search_archive = settings.search_archives_by_default if include_archive is None else include_archive
+    archive_items = (
+        _search_archived_runtime_logs(
+            db,
+            workspace_id=workspace_id,
+            role=normalized_role,
+            process_id=process_id,
+            levels=levels,
+            keyword=keyword.strip() if keyword else None,
+            start=start,
+            end=end,
+            limit=limit,
+        )
+        if should_search_archive
+        else []
+    )
+    combined = hot_items + archive_items
+    combined.sort(key=lambda item: (_runtime_log_info_time(item), item.log_id), reverse=True)
+    combined = combined[:limit]
     db.commit()
     return RuntimeLogListResponse(
         storage_available=True,
-        items=[_runtime_log_to_info(row) for row in reversed(rows)],
+        items=list(reversed(combined)),
+        archive_searched=should_search_archive,
     )
 
 

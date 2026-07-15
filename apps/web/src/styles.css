@@ -500,6 +500,7 @@ h1, h2, h3, p { margin: 0; }
 }
 
 .log-line.error { color: #ff7b7b; }
+.log-line.warn { color: #ffd166; }
 .log-line.debug { color: #76a9ff; }
 .log-line.success { color: #5fe08f; }
 .log-line.info { color: #f3f7fb; }
@@ -580,6 +581,12 @@ h1, h2, h3, p { margin: 0; }
 }
 
 .field.full { grid-column: 1 / -1; }
+
+.field.check-field input[type="checkbox"] {
+  width: 18px;
+  min-height: 18px;
+  align-self: center;
+}
 
 .field > span,
 .field > label {

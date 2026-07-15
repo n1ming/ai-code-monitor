@@ -93,6 +93,7 @@ type LogSettings = {
   retention_days: number;
   default_log_limit: number;
   sync_tail_lines: number;
+  search_archives_by_default: boolean;
   storage_available: boolean;
   warning: string | null;
 };
@@ -166,25 +167,37 @@ function App() {
   const [logSettingsOpen, setLogSettingsOpen] = React.useState(false);
   const [editingWorkspace, setEditingWorkspace] = React.useState<Workspace | null>(null);
   const [pendingDeleteWorkspace, setPendingDeleteWorkspace] = React.useState<Workspace | null>(null);
-  const [toast, setToast] = React.useState<string | null>(null);
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
   const [loadingWorkspaces, setLoadingWorkspaces] = React.useState(false);
   const [actioningWorkspaces, setActioningWorkspaces] = React.useState<Record<string, boolean>>({});
   const [clockTick, setClockTick] = React.useState(() => Date.now());
+  const workspaceLoadSeq = React.useRef(0);
+  const workspaceMutationVersion = React.useRef(0);
+  const deletedWorkspaceIds = React.useRef<Set<string>>(new Set());
+  const workspaceLoadInFlight = React.useRef(false);
 
-  const loadWorkspaces = React.useCallback(async () => {
+  const loadWorkspaces = React.useCallback(async (options: { force?: boolean } = {}) => {
+    if (workspaceLoadInFlight.current && !options.force) return;
+    workspaceLoadInFlight.current = true;
+    const requestSeq = workspaceLoadSeq.current + 1;
+    workspaceLoadSeq.current = requestSeq;
+    const mutationVersionAtStart = workspaceMutationVersion.current;
     setLoadingWorkspaces(true);
     setDeleteError(null);
     try {
       const response = await fetch("/api/workspaces");
       if (!response.ok) throw new Error(await response.text());
       const data = (await response.json()) as WorkspaceListResponse;
-      setWorkspaces(data.items.map(fromApiWorkspace));
+      if (requestSeq !== workspaceLoadSeq.current || mutationVersionAtStart !== workspaceMutationVersion.current) return;
+      const deletedIds = deletedWorkspaceIds.current;
+      setWorkspaces(data.items.map(fromApiWorkspace).filter((workspace) => !deletedIds.has(workspace.id)));
       if (data.warning) setDeleteError(data.warning);
     } catch (err) {
+      if (requestSeq !== workspaceLoadSeq.current) return;
       setDeleteError(err instanceof Error ? err.message : "加载工作区失败");
     } finally {
-      setLoadingWorkspaces(false);
+      if (requestSeq === workspaceLoadSeq.current) workspaceLoadInFlight.current = false;
+      if (requestSeq === workspaceLoadSeq.current) setLoadingWorkspaces(false);
     }
   }, []);
 
@@ -209,7 +222,7 @@ function App() {
   React.useEffect(() => {
     const timer = window.setInterval(() => {
       void loadWorkspaces();
-    }, 5000);
+    }, 1000);
     return () => window.clearInterval(timer);
   }, [loadWorkspaces]);
 
@@ -251,6 +264,7 @@ function App() {
 
   const toggleRun = async (workspace: Workspace) => {
     setDeleteError(null);
+    workspaceMutationVersion.current += 1;
     setActioningWorkspaces((current) => ({ ...current, [workspace.id]: true }));
     try {
       const action = workspace.status === "running" ? "stop" : "start";
@@ -259,10 +273,13 @@ function App() {
       });
       if (!response.ok) throw new Error(await response.text());
       const updated = fromApiWorkspace((await response.json()) as ApiWorkspace);
+      deletedWorkspaceIds.current.delete(updated.id);
       setWorkspaces((current) => current.map((item) => (item.id === updated.id ? updated : item)));
-      setToast(action === "start" ? "工作区已启动，Monitor 和 Agent 已运行。" : "工作区已停止，相关进程已结束。");
-      window.setTimeout(() => setToast(null), 2600);
+      workspaceMutationVersion.current += 1;
+      void loadWorkspaces({ force: true });
     } catch (err) {
+      workspaceMutationVersion.current += 1;
+      void loadWorkspaces({ force: true });
       setDeleteError(err instanceof Error ? err.message : "运行状态切换失败");
     } finally {
       setActioningWorkspaces((current) => ({ ...current, [workspace.id]: false }));
@@ -271,25 +288,30 @@ function App() {
 
   const deleteWorkspace = async (id: string) => {
     setDeleteError(null);
+    workspaceMutationVersion.current += 1;
     try {
       const response = await fetch(`/api/workspaces/${encodeURIComponent(id)}`, {
         method: "DELETE"
       });
       if (!response.ok) throw new Error(await response.text());
+      deletedWorkspaceIds.current.add(id);
       setWorkspaces((current) => current.filter((workspace) => workspace.id !== id));
       setOpenLogs((current) => {
         const next = { ...current };
         delete next[id];
         return next;
       });
-      setToast("工作区已删除，关联 process_id 已释放。");
-      window.setTimeout(() => setToast(null), 2600);
+      workspaceMutationVersion.current += 1;
+      void loadWorkspaces({ force: true });
     } catch (err) {
+      workspaceMutationVersion.current += 1;
+      void loadWorkspaces({ force: true });
       setDeleteError(err instanceof Error ? err.message : "删除工作区失败");
     }
   };
 
   const saveWorkspace = async (workspace: Workspace, isEdit: boolean) => {
+    workspaceMutationVersion.current += 1;
     const response = await fetch(isEdit ? `/api/workspaces/${encodeURIComponent(workspace.id)}` : "/api/workspaces", {
       method: isEdit ? "PUT" : "POST",
       headers: { "Content-Type": "application/json" },
@@ -297,14 +319,15 @@ function App() {
     });
     if (!response.ok) throw new Error(await response.text());
     const saved = fromApiWorkspace((await response.json()) as ApiWorkspace);
+    deletedWorkspaceIds.current.delete(saved.id);
     setWorkspaces((current) => {
       const exists = current.some((item) => item.id === saved.id);
       if (exists) return current.map((item) => (item.id === saved.id ? saved : item));
       return [saved, ...current];
     });
+    workspaceMutationVersion.current += 1;
+    void loadWorkspaces({ force: true });
     setModalOpen(false);
-    setToast("工作区、process_id 和进程关系已保存到 MySQL。");
-    window.setTimeout(() => setToast(null), 2600);
   };
 
   return (
@@ -334,13 +357,6 @@ function App() {
       </header>
 
       <main className="main">
-        {toast ? (
-          <section className="toast">
-            <CheckCircle2 size={18} />
-            {toast}
-          </section>
-        ) : null}
-
         {deleteError ? (
           <section className="toast error">
             <XCircle size={18} />
@@ -448,8 +464,6 @@ function App() {
           onClose={() => setLogSettingsOpen(false)}
           onSaved={(settings) => {
             setLogLimit(settings.default_log_limit);
-            setToast("日志设置已保存。");
-            window.setTimeout(() => setToast(null), 2600);
           }}
         />
       ) : null}
@@ -551,6 +565,7 @@ function LogSettingsModal({
   const [retentionDays, setRetentionDays] = React.useState(30);
   const [defaultLogLimit, setDefaultLogLimit] = React.useState(1000);
   const [syncTailLines, setSyncTailLines] = React.useState(5000);
+  const [searchArchivesByDefault, setSearchArchivesByDefault] = React.useState(true);
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -567,6 +582,7 @@ function LogSettingsModal({
         setRetentionDays(data.retention_days);
         setDefaultLogLimit(data.default_log_limit);
         setSyncTailLines(data.sync_tail_lines);
+        setSearchArchivesByDefault(data.search_archives_by_default);
         if (data.warning) setError(data.warning);
       } catch (err) {
         setError(err instanceof Error ? err.message : "日志设置加载失败");
@@ -601,7 +617,8 @@ function LogSettingsModal({
           archive_root: archiveRoot,
           retention_days: retentionDays,
           default_log_limit: defaultLogLimit,
-          sync_tail_lines: syncTailLines
+          sync_tail_lines: syncTailLines,
+          search_archives_by_default: searchArchivesByDefault
         })
       });
       if (!response.ok) throw new Error(await response.text());
@@ -653,6 +670,10 @@ function LogSettingsModal({
             <label className="field">
               <span>同步扫描行数</span>
               <input type="number" min={100} max={50000} value={syncTailLines} onChange={(event) => setSyncTailLines(Number(event.target.value))} disabled={loading} />
+            </label>
+            <label className="field check-field">
+              <span>默认搜索归档</span>
+              <input type="checkbox" checked={searchArchivesByDefault} onChange={(event) => setSearchArchivesByDefault(event.target.checked)} disabled={loading} />
             </label>
           </div>
         </div>
@@ -847,7 +868,7 @@ function WorkspaceModal({
             </label>
             <label className="field">
               <span>Agent 启动命令</span>
-              <input value={agentCommand} onChange={(event) => setAgentCommand(event.target.value)} placeholder="codex" />
+              <input value={agentCommand} onChange={(event) => setAgentCommand(event.target.value)} placeholder="codex / claude / opencode run --prompt-file {prompt_file}" />
             </label>
 
             <label className="field full">
@@ -992,6 +1013,7 @@ function formatRuntimeSeconds(totalSeconds: number) {
 function logLineClass(line: string) {
   const clean = cleanLogLine(line);
   if (clean.includes(" ERROR ")) return "log-line error";
+  if (clean.includes(" WARNING ") || clean.includes(" WARN ")) return "log-line warn";
   if (clean.includes(" DEBUG ")) return "log-line debug";
   if (clean.includes(" SUCCESS ")) return "log-line success";
   return "log-line info";
@@ -1002,7 +1024,7 @@ function cleanLogLine(line: string) {
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)?/g, "")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\x1b/g, "")
-    .replace(/^\s*\d{1,4}\s+(?=\S)/, "")
+    .replace(/^\s*\d{1,3}(?:\s+|(?=[^\d\s]))/, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
     .trim();
 }

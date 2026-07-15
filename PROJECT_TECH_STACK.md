@@ -443,7 +443,7 @@ Agent 停止工作时，Monitor 发送：
 继续
 ```
 
-## 10. Codex 适配规则
+## 10. Agent 适配规则
 
 用户输入 Agent 启动命令为：
 
@@ -467,12 +467,64 @@ codex --no-alt-screen -a never -s read-only
 
 这样可以减少全屏 TUI 对日志采集和进程通信的干扰。
 
+用户输入 Agent 启动命令为：
+
+```text
+claude
+```
+
+后端会转换为 Claude Code 更适合自动化的参数形式，把初始化提示词作为命令参数传入，避免只启动交互界面后提示词无法稳定送达。
+
+允许 AI 修改代码：
+
+```text
+claude --dangerously-skip-permissions "{prompt}"
+```
+
+不允许 AI 修改代码：
+
+```text
+claude --disallowedTools Edit MultiEdit Write NotebookEdit "{prompt}"
+```
+
+如果用户已经在 `claude` 命令里设置了 `--permission-mode` 或权限跳过参数，后端会尊重用户设置，只追加 `{prompt}`。
+
+其它 Agent 不再由后端硬编码适配。用户可以在 Agent 启动命令里显式使用通用占位符：
+
+```text
+{prompt}
+{prompt_file}
+{project_path}
+{workspace_name}
+```
+
+示例：
+
+```text
+opencode run --prompt-file {prompt_file}
+```
+
+```text
+some-agent --cwd {project_path} "{prompt}"
+```
+
+系统启动时会把初始化提示词写入当前工作区：
+
+```text
+.ai-code-monitor/bridge/initial-prompt.txt
+```
+
+如果命令包含 `{prompt}` 或 `{prompt_file}`，Monitor 会在启动 Agent 前完成替换，并把提示词作为命令参数或文件传给 Agent。如果命令不包含这些占位符，系统会退回兼容模式：先启动 Agent，再通过 PTY 向它发送初始化提示词。
+
 ## 11. 近期已完成更新
 
 - 项目迁移到 `/Users/n1ming/PycharmProjects/ai-code-monitor`
 - 前端标题更新为 `AI-Code-Monitor Dashbord`
 - Agent 类型选择改为 Agent 启动命令输入
 - 内部 `process_id` 替代系统 PID 作为稳定身份
+- 系统层面会把 Agent 启动、提示词投递、异常提醒、Agent 重启等事件写入 Agent 日志
+- `codex` 和 `claude` 启动命令均由后端做自动化适配
+- 其它 Agent 支持通过 `{prompt}` / `{prompt_file}` / `{project_path}` / `{workspace_name}` 接入
 - `process_id` 默认生成，并支持用户编辑后实时重复校验
 - MySQL 作为主配置存储
 - 创建工作区时生成 `monitor.py`
