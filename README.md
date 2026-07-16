@@ -15,6 +15,7 @@
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-backend-009688?logo=fastapi&logoColor=white" />
   <img alt="React" src="https://img.shields.io/badge/React-frontend-61DAFB?logo=react&logoColor=222" />
   <img alt="MySQL" src="https://img.shields.io/badge/MySQL-storage-4479A1?logo=mysql&logoColor=white" />
+  <img alt="Docker" src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green" />
 </p>
 
@@ -49,8 +50,6 @@ AI-Code-Monitor 是一个本地 AI 脚本监控系统，用来管理多个脚本
 | Monitor | 自动生成的监督脚本 | `monitor.py` |
 
 > `process_id` 是系统内部稳定 ID，不是操作系统 PID。OS PID 只作为运行时实例信息记录。
-
-![AI-Code-Monitor architecture](images/ai-monitor-architecture.png)
 
 ## 功能特性
 
@@ -191,8 +190,6 @@ ai-code-monitor/
         process-log.html
   images/
     brand-icon.png
-    ai-monitor-architecture.png
-  PROJECT_TECH_STACK.md
   README.md
   README.en.md
 ```
@@ -279,7 +276,7 @@ http://127.0.0.1:5173
 
 ## Docker 部署
 
-项目已提供 Docker Compose 配置，可以启动 MySQL、后端 API 和前端 Nginx：
+推荐使用 Docker Compose 启动完整环境，包括 MySQL、后端 API 和前端 Nginx：
 
 ```bash
 ./build-docker.sh
@@ -304,16 +301,16 @@ mysql+pymysql://root@mysql:3306/ai_code_monitor?charset=utf8mb4
 ./data -> /app/data
 ```
 
-如果要监控宿主机上的其它项目目录，不要直接把本机路径写进仓库里的 `docker-compose.yml`。执行 `./build-docker.sh` 时可以填写“额外挂载宿主机可浏览根目录”，脚本会生成本地专用的 `docker-compose.override.yml`，该文件已被 Git 忽略。
+如果要监控宿主机上的其它项目目录，可以在执行 `./build-docker.sh` 时填写额外挂载目录。
 
-Docker 或云服务器环境没有 macOS Finder 弹窗。点击“选择目录”时，系统会改为浏览后端允许的目录，默认只允许：
+容器部署时，目录选择器只会展示后端允许访问的挂载根目录。默认允许：
 
 ```text
 /workspaces
 /app/data/workspaces
 ```
 
-可通过环境变量调整：
+可通过环境变量调整允许访问的根目录：
 
 ```env
 AICM_ALLOWED_WORKSPACE_ROOTS=/workspaces,/app/data/workspaces
@@ -329,7 +326,7 @@ AICM_ALLOWED_WORKSPACE_ROOTS=/workspaces,/app/data/workspaces
 - 宿主机工作区挂载目录
 - 可选的额外挂载宿主机可浏览根目录
 
-脚本会把本地运行配置写入 `.env.docker.local`，可选挂载写入 `docker-compose.override.yml`，这两个文件都已被 Git 忽略，不属于发布内容。后端容器会将配置注入 Agent：
+构建脚本会根据你的输入完成 Agent 环境配置。后端容器会将配置注入 Agent：
 
 - Codex：写入工作区隔离的 `CODEX_HOME/config.toml`，并使用 `--dangerously-bypass-approvals-and-sandbox`
 - Claude Code：使用 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`，并使用 `--permission-mode bypassPermissions --dangerously-skip-permissions`

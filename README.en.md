@@ -15,6 +15,7 @@
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-backend-009688?logo=fastapi&logoColor=white" />
   <img alt="React" src="https://img.shields.io/badge/React-frontend-61DAFB?logo=react&logoColor=222" />
   <img alt="MySQL" src="https://img.shields.io/badge/MySQL-storage-4479A1?logo=mysql&logoColor=white" />
+  <img alt="Docker" src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green" />
 </p>
 
@@ -49,8 +50,6 @@ Each workspace binds three logical process identities:
 | Monitor | Generated supervisor script | `monitor.py` |
 
 > `process_id` is an internal stable identifier. It is not the operating system PID. OS PIDs are recorded only as runtime instance metadata.
-
-![AI-Code-Monitor architecture](images/ai-monitor-architecture.png)
 
 ## Features
 
@@ -191,8 +190,6 @@ ai-code-monitor/
         process-log.html
   images/
     brand-icon.png
-    ai-monitor-architecture.png
-  PROJECT_TECH_STACK.md
   README.md
   README.en.md
 ```
@@ -279,7 +276,7 @@ http://127.0.0.1:5173
 
 ## Docker Deployment
 
-The project includes Docker Compose configuration for MySQL, the backend API, and the frontend Nginx container:
+Docker Compose is the recommended way to start the full environment, including MySQL, the backend API, and the frontend Nginx container:
 
 ```bash
 ./build-docker.sh
@@ -304,16 +301,16 @@ Note: Docker can only access paths inside the container or paths mounted into th
 ./data -> /app/data
 ```
 
-To monitor other host project directories, do not hard-code local paths into the repository `docker-compose.yml`. When running `./build-docker.sh`, enter an optional extra host root. The script generates a local-only `docker-compose.override.yml`, which is ignored by Git.
+To monitor other host project directories, enter an optional extra host root when running `./build-docker.sh`.
 
-Docker and cloud server environments do not have a macOS Finder picker. When clicking "选择目录", the app falls back to browsing backend-allowed directories. By default, only these roots are allowed:
+In container deployments, the directory picker only shows mounted roots that the backend is allowed to access. By default, these roots are allowed:
 
 ```text
 /workspaces
 /app/data/workspaces
 ```
 
-You can change them with:
+You can change the allowed roots with:
 
 ```env
 AICM_ALLOWED_WORKSPACE_ROOTS=/workspaces,/app/data/workspaces
@@ -329,7 +326,7 @@ The build script checks Docker, Docker Compose, occupied ports, and the npm mirr
 - Host workspace mount directory
 - Optional extra host root to browse and mount
 
-The script writes local runtime settings to `.env.docker.local` and optional volume overrides to `docker-compose.override.yml`. Both files are ignored by Git and are not release artifacts. The backend container injects the selected settings into the Agent:
+The build script configures the Agent environment from your input. The backend container injects the selected settings into the Agent:
 
 - Codex: writes an isolated `CODEX_HOME/config.toml` and uses `--dangerously-bypass-approvals-and-sandbox`
 - Claude Code: uses `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` and `--permission-mode bypassPermissions --dangerously-skip-permissions`
