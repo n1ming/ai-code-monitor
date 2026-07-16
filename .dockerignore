@@ -1,0 +1,16 @@
+.git
+.idea
+.venv
+**/__pycache__
+**/*.pyc
+**/.env
+**/.env.*
+!**/.env.example
+apps/web/node_modules
+apps/web/dist
+apps/web/tsconfig.tsbuildinfo
+data/log-archives
+docker/workspaces
+.env.docker.local
+docker-compose.override.yml
+apps/server/.env

@@ -181,7 +181,7 @@ ai-code-monitor/
     server/
       app/
         main.py
-      .env
+      .env.example
     web/
       src/
         main.tsx
@@ -229,10 +229,10 @@ CREATE DATABASE ai_code_monitor CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
 
 ### 2. 配置后端环境变量
 
-创建或更新：
+复制示例配置并按需修改：
 
-```text
-apps/server/.env
+```bash
+cp apps/server/.env.example apps/server/.env
 ```
 
 示例：
@@ -248,15 +248,23 @@ cd apps/web
 npm install
 ```
 
-### 4. 启动后端
+### 4. 安装后端依赖
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r apps/server/requirements.txt
+```
+
+### 5. 启动后端
 
 在项目根目录执行：
 
 ```bash
-.venv/bin/uvicorn apps.server.app.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn apps.server.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-### 5. 启动前端
+### 6. 启动前端
 
 ```bash
 cd apps/web
@@ -268,6 +276,95 @@ npm run dev
 ```text
 http://127.0.0.1:5173
 ```
+
+## Docker 部署
+
+项目已提供 Docker Compose 配置，可以启动 MySQL、后端 API 和前端 Nginx：
+
+```bash
+./build-docker.sh
+```
+
+访问：
+
+```text
+http://127.0.0.1:8080
+```
+
+容器内后端会连接 Compose 里的 MySQL：
+
+```text
+mysql+pymysql://root@mysql:3306/ai_code_monitor?charset=utf8mb4
+```
+
+注意：Docker 环境只能访问容器内路径或挂载进容器的路径。默认预留工作区挂载目录是：
+
+```text
+./docker/workspaces -> /workspaces
+./data -> /app/data
+```
+
+如果要监控宿主机上的其它项目目录，不要直接把本机路径写进仓库里的 `docker-compose.yml`。执行 `./build-docker.sh` 时可以填写“额外挂载宿主机可浏览根目录”，脚本会生成本地专用的 `docker-compose.override.yml`，该文件已被 Git 忽略。
+
+Docker 或云服务器环境没有 macOS Finder 弹窗。点击“选择目录”时，系统会改为浏览后端允许的目录，默认只允许：
+
+```text
+/workspaces
+/app/data/workspaces
+```
+
+可通过环境变量调整：
+
+```env
+AICM_ALLOWED_WORKSPACE_ROOTS=/workspaces,/app/data/workspaces
+```
+
+构建脚本会检查 Docker、Docker Compose、端口占用和 npm 镜像源，然后询问：
+
+- 选择 `codex` 还是 `claude code`
+- Agent API Base URL
+- Agent API Key
+- Agent 模型名
+- 是否开启最高权限模式
+- 宿主机工作区挂载目录
+- 可选的额外挂载宿主机可浏览根目录
+
+脚本会把本地运行配置写入 `.env.docker.local`，可选挂载写入 `docker-compose.override.yml`，这两个文件都已被 Git 忽略，不属于发布内容。后端容器会将配置注入 Agent：
+
+- Codex：写入工作区隔离的 `CODEX_HOME/config.toml`，并使用 `--dangerously-bypass-approvals-and-sandbox`
+- Claude Code：使用 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`，并使用 `--permission-mode bypassPermissions --dangerously-skip-permissions`
+
+后端 Docker 镜像默认通过国内镜像源安装 Agent CLI：
+
+```text
+NPM_REGISTRY=https://registry.npmmirror.com
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
+INSTALL_CODEX=true
+INSTALL_CLAUDE_CODE=false
+```
+
+如果要尝试同时安装 Claude Code CLI，可以在启动前设置：
+
+```bash
+INSTALL_CLAUDE_CODE=true docker compose build server
+```
+
+Claude Code 即使安装成功，运行时登录和 API 连通性仍可能依赖你的网络环境；默认不强制安装。
+
+Docker Compose 默认也使用 DaoCloud 的基础镜像源：
+
+```bash
+NODE_IMAGE=docker.m.daocloud.io/library/node:22-slim \
+PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.11-slim \
+WEB_NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine \
+NGINX_IMAGE=docker.m.daocloud.io/library/nginx:1.27-alpine \
+MYSQL_IMAGE=docker.m.daocloud.io/library/mysql:8.4 \
+docker compose build
+```
+
+如果你的网络可以直接访问 Docker Hub，也可以把这些环境变量改回官方镜像名。
 
 ## 构建
 

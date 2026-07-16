@@ -111,10 +111,11 @@ CREATE TABLE IF NOT EXISTS log_settings (
   retention_days INT NOT NULL DEFAULT 30,
   default_log_limit INT NOT NULL DEFAULT 1000,
   sync_tail_lines INT NOT NULL DEFAULT 5000,
+  search_archives_by_default BOOLEAN NOT NULL DEFAULT TRUE,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-INSERT INTO log_settings (id, archive_root, retention_days, default_log_limit, sync_tail_lines)
-VALUES (1, '', 30, 1000, 5000)
+INSERT INTO log_settings (id, archive_root, retention_days, default_log_limit, sync_tail_lines, search_archives_by_default)
+VALUES (1, '', 30, 1000, 5000, TRUE)
 ON DUPLICATE KEY UPDATE id = id;

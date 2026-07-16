@@ -31,6 +31,17 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 load_dotenv("apps/server/.env")
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _toml_quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
 class ProcessInfo(BaseModel):
     pid: int
     name: str | None = None
@@ -179,6 +190,20 @@ class DirectorySelectionResponse(BaseModel):
     selected: bool
     path: str | None = None
     message: str | None = None
+
+
+class DirectoryEntry(BaseModel):
+    name: str
+    path: str
+
+
+class DirectoryListResponse(BaseModel):
+    current_path: str
+    parent_path: str | None
+    roots: list[str]
+    items: list[DirectoryEntry]
+    selectable: bool
+    warning: str | None = None
 
 
 class RuntimeLogCreate(BaseModel):
@@ -810,6 +835,7 @@ def _archive_expired_runtime_logs(db: Session, limit: int = 10000) -> None:
 
     if archived_ids:
         db.execute(delete(RuntimeLog).where(RuntimeLog.log_id.in_(archived_ids)))
+        db.flush()
 
 
 def _runtime_log_to_info(row: RuntimeLog) -> RuntimeLogInfo:
@@ -948,8 +974,13 @@ def _search_archived_runtime_logs(
         archive_query.order_by(LogArchive.archive_date.desc(), LogArchive.id.desc())
     ).all()
     matches: list[RuntimeLogInfo] = []
+    searched_paths: set[Path] = set()
     for archive in archives:
         path = Path(archive.file_path).expanduser()
+        normalized_path = path.resolve() if path.exists() else path
+        if normalized_path in searched_paths:
+            continue
+        searched_paths.add(normalized_path)
         if not path.exists() or not path.is_file():
             continue
         try:
@@ -1172,6 +1203,67 @@ def _runtime_paths(root: Path) -> dict[str, Path]:
     }
 
 
+def _diagnostic_tail(label: str, path: Path, limit: int = 25) -> str | None:
+    lines = _tail_file(path, limit)
+    if not lines:
+        return None
+    return f"{label}:\n" + "\n".join(lines[-limit:])
+
+
+def _agent_start_diagnostics(paths: dict[str, Path], agent_command: str, monitor_process: subprocess.Popen[bytes] | None = None) -> str:
+    sections = [
+        f"Agent 启动命令: {agent_command}",
+    ]
+    if monitor_process is not None:
+        sections.append(f"监督脚本 OS PID: {monitor_process.pid}，退出码: {monitor_process.poll()}")
+
+    for label, key in [
+        ("monitor.err.log", "monitor_err_log"),
+        ("monitor.log", "monitor_log"),
+        ("monitor.out.log", "monitor_out_log"),
+        ("agent.out.log", "agent_out_log"),
+        ("agent.log", "agent_log"),
+    ]:
+        section = _diagnostic_tail(label, paths[key])
+        if section:
+            sections.append(section)
+    return "\n\n".join(sections)
+
+
+def _agent_executable_from_command(agent_command: str) -> str | None:
+    try:
+        parts = shlex.split(agent_command)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    if any(part in {";", "&&", "||", "|"} for part in parts):
+        return None
+    return parts[0]
+
+
+def _ensure_agent_command_available(agent_command: str) -> None:
+    executable = _agent_executable_from_command(agent_command)
+    if not executable:
+        return
+    if shutil.which(executable):
+        return
+    install_hint = ""
+    executable_name = Path(executable).name
+    if executable_name == "claude":
+        install_hint = "当前 Docker server 镜像没有安装 Claude Code。请用 INSTALL_CLAUDE_CODE=true 重新构建 server 镜像，或运行 ./build-docker.sh 选择 claude code。"
+    elif executable_name == "codex":
+        install_hint = "当前 Docker server 镜像没有安装 Codex CLI。请用 INSTALL_CODEX=true 重新构建 server 镜像，或运行 ./build-docker.sh 选择 codex。"
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"Agent 命令不可用: {executable}。"
+            f"PATH={os.getenv('PATH', '')}。"
+            f"{install_hint}"
+        ),
+    )
+
+
 def _process_ids_for_workspace(db: Session, workspace_id: str) -> WorkspaceProcessIds:
     identities = db.scalars(
         select(ProcessIdentity).where(ProcessIdentity.workspace_id == workspace_id)
@@ -1201,6 +1293,14 @@ def _is_codex_agent_command(workspace: Workspace) -> bool:
     return command == "codex" or command.startswith("codex ")
 
 
+def _is_claude_agent_command(workspace: Workspace) -> bool:
+    try:
+        parts = shlex.split(workspace.agent_command.strip())
+    except ValueError:
+        return False
+    return bool(parts and Path(parts[0]).name == "claude")
+
+
 def _strip_mcp_servers_from_codex_config(content: str) -> str:
     kept: list[str] = []
     skipping = False
@@ -1214,27 +1314,65 @@ def _strip_mcp_servers_from_codex_config(content: str) -> str:
     return "\n".join(kept).strip() + "\n"
 
 
+def _strip_model_provider_section(content: str, provider: str) -> str:
+    kept: list[str] = []
+    skipping = False
+    provider_section = f"model_providers.{provider}"
+    for line in content.splitlines():
+        section_match = re.match(r"\s*\[([^]]+)]\s*$", line)
+        if section_match:
+            section_name = section_match.group(1).strip()
+            skipping = section_name == provider_section
+        if not skipping:
+            kept.append(line)
+    return "\n".join(kept).strip() + "\n"
+
+
 def _prepare_codex_home(root: Path, workspace: Workspace, paths: dict[str, Path]) -> Path | None:
     if not _is_codex_agent_command(workspace):
         return None
 
+    configured_home = os.getenv("AICM_CODEX_HOME")
     source_home = Path(os.getenv("CODEX_HOME", Path.home() / ".codex")).expanduser()
     target_home = paths["codex_home"]
     target_home.mkdir(parents=True, exist_ok=True)
 
-    auth_source = source_home / "auth.json"
-    if auth_source.exists():
+    auth_source = Path(configured_home).expanduser() / "auth.json" if configured_home else source_home / "auth.json"
+    if auth_source.exists() and auth_source.resolve() != (target_home / "auth.json").resolve():
         shutil.copy2(auth_source, target_home / "auth.json")
 
-    install_source = source_home / "installation_id"
-    if install_source.exists():
+    install_source = Path(configured_home).expanduser() / "installation_id" if configured_home else source_home / "installation_id"
+    if install_source.exists() and install_source.resolve() != (target_home / "installation_id").resolve():
         shutil.copy2(install_source, target_home / "installation_id")
 
-    source_config = source_home / "config.toml"
-    if source_config.exists():
+    source_config = Path(configured_home).expanduser() / "config.toml" if configured_home else source_home / "config.toml"
+    if source_config.exists() and source_config.resolve() != (target_home / "config.toml").resolve():
         config = _strip_mcp_servers_from_codex_config(source_config.read_text(encoding="utf-8"))
     else:
         config = ""
+
+    base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("AICM_AGENT_BASE_URL")
+    api_key_env = os.getenv("AICM_CODEX_API_KEY_ENV", "OPENAI_API_KEY")
+    model = os.getenv("AICM_CODEX_MODEL", "").strip()
+    if base_url:
+        provider = os.getenv("AICM_CODEX_PROVIDER", "aicm").strip() or "aicm"
+        requires_openai_auth = _env_bool("AICM_CODEX_REQUIRES_OPENAI_AUTH", False)
+        config = re.sub(r"(?m)^model_provider\s*=.*\n?", "", config).rstrip()
+        config = f'model_provider = "{provider}"\n' + config.lstrip()
+        if model:
+            config = re.sub(r"(?m)^model\s*=.*\n?", "", config).rstrip()
+            config = f"model = {_toml_quote(model)}\n" + config.lstrip()
+        config = _strip_model_provider_section(config, provider)
+        config = (
+            config.rstrip()
+            + f"\n\n[model_providers.{provider}]\n"
+            + f"name = {_toml_quote(provider)}\n"
+            + f"base_url = {_toml_quote(base_url)}\n"
+            + f"env_key = {_toml_quote(api_key_env)}\n"
+            + "wire_api = \"responses\"\n"
+            + ("requires_openai_auth = true\n" if requires_openai_auth else "")
+        )
+
     trusted_project = f'[projects."{root}"]\ntrust_level = "trusted"\n'
     if f'[projects."{root}"]' not in config:
         config = config.rstrip() + "\n\n" + trusted_project
@@ -1487,7 +1625,10 @@ def _build_initial_prompt(workspace: Workspace, process_ids: WorkspaceProcessIds
 
 def _agent_runtime_command(workspace: Workspace) -> str:
     command = workspace.agent_command.strip()
-    if command == "codex":
+    selected_agent = os.getenv("AICM_SELECTED_AGENT", "").strip().lower()
+    if command == "codex" or (not command and selected_agent == "codex"):
+        if _env_bool("AICM_AGENT_YOLO", True):
+            return "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox {prompt}"
         sandbox = "workspace-write" if workspace.ai_can_edit else "read-only"
         return f"codex --no-alt-screen -a never -s {sandbox} {{prompt}}"
     try:
@@ -1495,18 +1636,40 @@ def _agent_runtime_command(workspace: Workspace) -> str:
     except ValueError:
         return command
     has_prompt_placeholder = any("{prompt}" in part or "{prompt_file}" in part for part in parts)
+    if parts and Path(parts[0]).name == "codex" and not has_prompt_placeholder:
+        has_yolo = "--dangerously-bypass-approvals-and-sandbox" in parts
+        has_approval = any(part == "-a" or part == "--ask-for-approval" or part.startswith("--ask-for-approval=") for part in parts)
+        has_sandbox = any(part == "-s" or part == "--sandbox" or part.startswith("--sandbox=") for part in parts)
+        parts.append("--no-alt-screen") if "--no-alt-screen" not in parts else None
+        if _env_bool("AICM_AGENT_YOLO", True):
+            if not has_yolo:
+                parts.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            if not has_approval:
+                parts.extend(["-a", "never"])
+            if not has_sandbox:
+                parts.extend(["-s", "workspace-write" if workspace.ai_can_edit else "read-only"])
+        parts.append("{prompt}")
+        return shlex.join(parts)
     if parts and Path(parts[0]).name == "claude" and not has_prompt_placeholder:
         has_permission_mode = any(part == "--permission-mode" or part.startswith("--permission-mode=") for part in parts)
         skips_permissions = any(
             part in {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"}
             for part in parts
         )
-        if workspace.ai_can_edit and not has_permission_mode and not skips_permissions:
-            parts.append("--dangerously-skip-permissions")
+        if _env_bool("AICM_AGENT_YOLO", True):
+            if not has_permission_mode:
+                parts.extend(["--permission-mode", "bypassPermissions"])
+            if not skips_permissions:
+                parts.append("--dangerously-skip-permissions")
+        elif workspace.ai_can_edit and not has_permission_mode and not skips_permissions:
+            parts.extend(["--permission-mode", "acceptEdits"])
         if not workspace.ai_can_edit and not any(part.startswith("--disallowedTools") or part.startswith("--disallowed-tools") for part in parts):
             parts.extend(["--disallowedTools", "Edit", "MultiEdit", "Write", "NotebookEdit"])
         parts.append("{prompt}")
         return shlex.join(parts)
+    if not command and selected_agent == "claude":
+        return "claude --permission-mode bypassPermissions --dangerously-skip-permissions {prompt}"
     return command
 
 
@@ -1854,6 +2017,8 @@ def _read_app_runtime_pid(workspace: Workspace) -> int | None:
         payload = json.loads(runtime_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if payload.get("status") != "running":
+        return None
     os_pid = payload.get("os_pid")
     if isinstance(os_pid, int):
         return os_pid
@@ -1869,6 +2034,22 @@ def _read_app_runtime_payload(workspace: Workspace) -> dict[str, object]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _mark_app_runtime_stopped(workspace: Workspace) -> None:
+    runtime_path = Path(workspace.path) / ".ai-code-monitor" / "app-runtime.json"
+    payload = _read_app_runtime_payload(workspace)
+    if not payload:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload["status"] = "stopped"
+    payload["watchdog_status"] = "stopped"
+    payload["stopped_at"] = now
+    payload["updated_at"] = now
+    try:
+        runtime_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return
 
 
 def _terminate_workspace_app_processes(workspace: Workspace) -> None:
@@ -1953,11 +2134,13 @@ def _start_workspace_processes(db: Session, workspace: Workspace) -> None:
         pass
 
     initial_prompt = json.loads((paths["base"] / "workspace-config.json").read_text(encoding="utf-8"))["initial_prompt"]
+    agent_command = _agent_runtime_command(workspace)
+    _ensure_agent_command_available(agent_command)
     monitor_env = {
         **os.environ,
         "AICM_WORKSPACE_NAME": workspace.name,
         "AICM_POLL_SECONDS": str(workspace.poll_seconds),
-        "AICM_AGENT_COMMAND": _agent_runtime_command(workspace),
+        "AICM_AGENT_COMMAND": agent_command,
         "AICM_AGENT_PID_FILE": str(paths["agent_pid"]),
         "AICM_AGENT_STDIN": str(paths["agent_stdin"]),
         "AICM_AGENT_HEARTBEAT": str(paths["agent_heartbeat"]),
@@ -1996,11 +2179,13 @@ def _start_workspace_processes(db: Session, workspace: Workspace) -> None:
         if agent_os_pid is not None:
             break
         if monitor_process.poll() is not None:
-            raise HTTPException(status_code=500, detail="监督脚本启动后立即退出，Agent 未启动。")
+            diagnostics = _agent_start_diagnostics(paths, agent_command, monitor_process)
+            raise HTTPException(status_code=500, detail=f"监督脚本启动后立即退出，Agent 未启动。\n\n{diagnostics}")
         time.sleep(0.1)
     if agent_os_pid is None:
         _terminate_pid_tree(monitor_process.pid)
-        raise HTTPException(status_code=500, detail="监督脚本未在 5 秒内写出 Agent PID。")
+        diagnostics = _agent_start_diagnostics(paths, agent_command, monitor_process)
+        raise HTTPException(status_code=500, detail=f"监督脚本未在 5 秒内写出 Agent PID。\n\n{diagnostics}")
 
     _record_runtime(
         db,
@@ -2020,7 +2205,7 @@ def _start_workspace_processes(db: Session, workspace: Workspace) -> None:
         process_id=process_ids.agent,
         role="agent",
         os_pid=agent_os_pid,
-        command=_agent_runtime_command(workspace),
+        command=agent_command,
         cwd=root,
         status="running",
         stdin_channel=paths["agent_stdin"],
@@ -2099,6 +2284,7 @@ def _stop_workspace_processes(db: Session, workspace_id: str, next_status: str =
 
     if workspace is not None:
         _terminate_workspace_app_processes(workspace)
+        _mark_app_runtime_stopped(workspace)
         workspace.status = next_status
 
 
@@ -2135,6 +2321,46 @@ def _occupied_processes() -> tuple[set[int], list[ProcessInfo]]:
 
     sample.sort(key=lambda item: item.pid)
     return occupied, sample
+
+
+def _allowed_workspace_roots() -> list[Path]:
+    raw_roots = [
+        item.strip()
+        for item in os.getenv("AICM_ALLOWED_WORKSPACE_ROOTS", "").split(",")
+        if item.strip()
+    ]
+    if not raw_roots:
+        raw_roots = ["/workspaces"] if Path("/workspaces").exists() else [str(Path.cwd())]
+
+    roots: list[Path] = []
+    for raw in raw_roots:
+        try:
+            root = Path(raw).expanduser().resolve()
+        except OSError:
+            continue
+        if root.exists() and root.is_dir() and root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _resolve_allowed_directory(raw_path: str | None) -> tuple[Path, Path, list[Path]]:
+    roots = _allowed_workspace_roots()
+    if not roots:
+        raise HTTPException(status_code=503, detail="没有可浏览的工作区根目录。请设置 AICM_ALLOWED_WORKSPACE_ROOTS。")
+
+    requested = Path(raw_path).expanduser() if raw_path else roots[0]
+    try:
+        resolved = requested.resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail=f"目录不可访问: {exc}") from exc
+
+    for root in roots:
+        if resolved == root or resolved.is_relative_to(root):
+            if not resolved.exists() or not resolved.is_dir():
+                raise HTTPException(status_code=404, detail="目录不存在或不是文件夹。")
+            return resolved, root, roots
+    allowed = ", ".join(str(root) for root in roots)
+    raise HTTPException(status_code=403, detail=f"目录不在允许浏览的工作区根目录内。当前允许根目录: {allowed}")
 
 
 @app.get("/health")
@@ -2175,6 +2401,38 @@ def select_directory() -> DirectorySelectionResponse:
         raise HTTPException(status_code=500, detail=message)
 
     return DirectorySelectionResponse(selected=True, path=output)
+
+
+@app.get("/api/system/directories", response_model=DirectoryListResponse)
+def list_directories(path: str | None = None) -> DirectoryListResponse:
+    current, active_root, roots = _resolve_allowed_directory(path)
+    parent_path = None
+    parent = current.parent
+    if current != active_root and (parent == active_root or parent.is_relative_to(active_root)):
+        parent_path = str(parent)
+
+    items: list[DirectoryEntry] = []
+    try:
+        for child in current.iterdir():
+            try:
+                if child.name.startswith("."):
+                    continue
+                if child.is_dir():
+                    items.append(DirectoryEntry(name=child.name, path=str(child.resolve())))
+            except OSError:
+                continue
+    except OSError as exc:
+        raise HTTPException(status_code=403, detail=f"目录不可读取: {exc}") from exc
+
+    items.sort(key=lambda item: item.name.lower())
+    return DirectoryListResponse(
+        current_path=str(current),
+        parent_path=parent_path,
+        roots=[str(root) for root in roots],
+        items=items[:500],
+        selectable=True,
+        warning="最多显示前 500 个子目录。" if len(items) > 500 else None,
+    )
 
 
 @app.get("/api/settings/logs", response_model=LogSettingsInfo)

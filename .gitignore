@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.idea/
+.venv/
+node_modules/
+.env
+.env.*
+!.env.example
+data/log-archives/
+docker/workspaces/
+.env.docker.local
+docker-compose.override.yml
+apps/server/.env

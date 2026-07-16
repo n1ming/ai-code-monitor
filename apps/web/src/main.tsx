@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ExternalLink,
   FileText,
+  Folder,
   Pencil,
   Plus,
   RefreshCw,
@@ -36,6 +37,20 @@ type DirectorySelection = {
   selected: boolean;
   path: string | null;
   message: string | null;
+};
+
+type DirectoryEntry = {
+  name: string;
+  path: string;
+};
+
+type DirectoryList = {
+  current_path: string;
+  parent_path: string | null;
+  roots: string[];
+  items: DirectoryEntry[];
+  selectable: boolean;
+  warning: string | null;
 };
 
 type ProcessIdField = "app" | "agent" | "watch";
@@ -158,6 +173,19 @@ function emptyRuntimeStatus(processIds: Record<ProcessIdField, string>): Record<
   };
 }
 
+async function readApiError(response: Response, fallback: string): Promise<string> {
+  const text = await response.text();
+  if (!text) return `${fallback}：HTTP ${response.status}`;
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown };
+    if (typeof parsed.detail === "string" && parsed.detail.trim()) return parsed.detail;
+    if (Array.isArray(parsed.detail)) return parsed.detail.map((item) => JSON.stringify(item)).join("\n");
+  } catch {
+    // Keep plain text response.
+  }
+  return text;
+}
+
 function App() {
   const [workspaces, setWorkspaces] = React.useState<Workspace[]>([]);
   const [search, setSearch] = React.useState("");
@@ -186,7 +214,7 @@ function App() {
     setDeleteError(null);
     try {
       const response = await fetch("/api/workspaces");
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) throw new Error(await readApiError(response, "加载工作区失败"));
       const data = (await response.json()) as WorkspaceListResponse;
       if (requestSeq !== workspaceLoadSeq.current || mutationVersionAtStart !== workspaceMutationVersion.current) return;
       const deletedIds = deletedWorkspaceIds.current;
@@ -271,7 +299,7 @@ function App() {
       const response = await fetch(`/api/workspaces/${encodeURIComponent(workspace.id)}/${action}`, {
         method: "POST"
       });
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) throw new Error(await readApiError(response, "运行状态切换失败"));
       const updated = fromApiWorkspace((await response.json()) as ApiWorkspace);
       deletedWorkspaceIds.current.delete(updated.id);
       setWorkspaces((current) => current.map((item) => (item.id === updated.id ? updated : item)));
@@ -293,7 +321,7 @@ function App() {
       const response = await fetch(`/api/workspaces/${encodeURIComponent(id)}`, {
         method: "DELETE"
       });
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) throw new Error(await readApiError(response, "删除工作区失败"));
       deletedWorkspaceIds.current.add(id);
       setWorkspaces((current) => current.filter((workspace) => workspace.id !== id));
       setOpenLogs((current) => {
@@ -317,7 +345,7 @@ function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(toApiWorkspace(workspace))
     });
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw new Error(await readApiError(response, "保存工作区失败"));
     const saved = fromApiWorkspace((await response.json()) as ApiWorkspace);
     deletedWorkspaceIds.current.delete(saved.id);
     setWorkspaces((current) => {
@@ -554,6 +582,126 @@ function ConfirmDeleteModal({
   );
 }
 
+async function trySystemDirectoryPicker(): Promise<string | null> {
+  const response = await fetch("/api/system/select-directory", { method: "POST" });
+  if (!response.ok) return null;
+  const data = (await response.json()) as DirectorySelection;
+  return data.selected && data.path ? data.path : null;
+}
+
+function DirectoryPickerModal({
+  title,
+  initialPath,
+  onSelect,
+  onClose
+}: {
+  title: string;
+  initialPath: string;
+  onSelect: (path: string) => void;
+  onClose: () => void;
+}) {
+  const [currentPath, setCurrentPath] = React.useState(initialPath);
+  const [data, setData] = React.useState<DirectoryList | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const load = React.useCallback(async (path?: string, allowFallback = true) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const query = path ? `?${new URLSearchParams({ path })}` : "";
+      const response = await fetch(`/api/system/directories${query}`);
+      if (!response.ok) {
+        let message = await response.text();
+        try {
+          const parsed = JSON.parse(message) as { detail?: string };
+          message = parsed.detail || message;
+        } catch {
+          // Keep raw response text.
+        }
+        if (path && allowFallback) {
+          const fallbackResponse = await fetch("/api/system/directories");
+          if (fallbackResponse.ok) {
+            const fallback = (await fallbackResponse.json()) as DirectoryList;
+            setData(fallback);
+            setCurrentPath(fallback.current_path);
+            setError(`${message} 已显示可选择的根目录。`);
+            return;
+          }
+        }
+        throw new Error(message);
+      }
+      const next = (await response.json()) as DirectoryList;
+      setData(next);
+      setCurrentPath(next.current_path);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "目录加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void load(initialPath || undefined);
+  }, [initialPath, load]);
+
+  const selectCurrent = () => {
+    if (!data?.selectable) return;
+    onSelect(data.current_path);
+    onClose();
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="confirm-modal directory-modal" role="dialog" aria-modal="true">
+        <header className="modal-head">
+          <h2>{title}</h2>
+          <button className="btn ghost" type="button" onClick={onClose}>
+            <X size={17} />
+            关闭
+          </button>
+        </header>
+        <div className="modal-body">
+          {error ? <div className="form-error">{error}</div> : null}
+          {data?.warning ? <div className="form-warning">{data.warning}</div> : null}
+          <div className="directory-path">{currentPath || "加载中"}</div>
+          {data?.roots.length ? (
+            <div className="directory-roots">
+              {data.roots.map((root) => (
+                <button className="btn ghost" type="button" key={root} onClick={() => void load(root)} disabled={loading || root === currentPath}>
+                  {root}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          <div className="directory-list">
+            {data?.parent_path ? (
+              <button className="directory-row" type="button" onClick={() => void load(data.parent_path ?? undefined)} disabled={loading}>
+                <Folder size={17} />
+                ..
+              </button>
+            ) : null}
+            {loading ? <div className="directory-empty">加载中</div> : null}
+            {!loading && data && data.items.length === 0 ? <div className="directory-empty">没有子目录</div> : null}
+            {!loading && data?.items.map((item) => (
+              <button className="directory-row" type="button" key={item.path} onClick={() => void load(item.path)}>
+                <Folder size={17} />
+                {item.name}
+              </button>
+            ))}
+          </div>
+        </div>
+        <footer className="modal-foot">
+          <button className="btn" type="button" onClick={onClose}>取消</button>
+          <button className="btn primary" type="button" onClick={selectCurrent} disabled={!data?.selectable || loading}>
+            选择当前目录
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function LogSettingsModal({
   onClose,
   onSaved
@@ -569,6 +717,7 @@ function LogSettingsModal({
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [directoryPickerOpen, setDirectoryPickerOpen] = React.useState(false);
 
   React.useEffect(() => {
     const load = async () => {
@@ -576,7 +725,7 @@ function LogSettingsModal({
       setError(null);
       try {
         const response = await fetch("/api/settings/logs");
-        if (!response.ok) throw new Error(await response.text());
+        if (!response.ok) throw new Error(await readApiError(response, "日志设置加载失败"));
         const data = (await response.json()) as LogSettings;
         setArchiveRoot(data.archive_root);
         setRetentionDays(data.retention_days);
@@ -596,13 +745,11 @@ function LogSettingsModal({
   const chooseArchiveRoot = async () => {
     setError(null);
     try {
-      const response = await fetch("/api/system/select-directory", { method: "POST" });
-      if (!response.ok) throw new Error(await response.text());
-      const data = (await response.json()) as DirectorySelection;
-      if (data.selected && data.path) setArchiveRoot(data.path);
-      else if (data.message) setError(data.message);
+      const picked = await trySystemDirectoryPicker();
+      if (picked) setArchiveRoot(picked);
+      else setDirectoryPickerOpen(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "目录选择失败");
+      setDirectoryPickerOpen(true);
     }
   };
 
@@ -621,7 +768,7 @@ function LogSettingsModal({
           search_archives_by_default: searchArchivesByDefault
         })
       });
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) throw new Error(await readApiError(response, "日志设置保存失败"));
       const saved = (await response.json()) as LogSettings;
       onSaved(saved);
       onClose();
@@ -685,6 +832,14 @@ function LogSettingsModal({
           </button>
         </footer>
       </section>
+      {directoryPickerOpen ? (
+        <DirectoryPickerModal
+          title="选择归档目录"
+          initialPath={archiveRoot}
+          onSelect={setArchiveRoot}
+          onClose={() => setDirectoryPickerOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -701,7 +856,7 @@ function WorkspaceModal({
   const isEdit = Boolean(workspace);
   const [name, setName] = React.useState(workspace?.name ?? "新工作区");
   const [workspaceId, setWorkspaceId] = React.useState(workspace?.id ?? "workspace_new");
-  const [path, setPath] = React.useState(workspace?.path ?? "/Users/n1ming/projects/my-app");
+  const [path, setPath] = React.useState(workspace?.path ?? "/workspaces/my-project");
   const [command, setCommand] = React.useState(workspace?.command ?? "python app.py");
   const [agentCommand, setAgentCommand] = React.useState(workspace?.agentCommand ?? "codex");
   const [pollSeconds, setPollSeconds] = React.useState(workspace?.pollSeconds ?? 30);
@@ -714,6 +869,7 @@ function WorkspaceModal({
   const [checking, setChecking] = React.useState<Partial<Record<ProcessIdField, boolean>>>({});
   const [saving, setSaving] = React.useState(false);
   const [selectingDirectory, setSelectingDirectory] = React.useState(false);
+  const [directoryPickerOpen, setDirectoryPickerOpen] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
   const loadDefaults = React.useCallback(async () => {
@@ -835,14 +991,11 @@ function WorkspaceModal({
     setSelectingDirectory(true);
     setError(null);
     try {
-      const response = await fetch("/api/system/select-directory", { method: "POST" });
-      if (!response.ok) throw new Error(await response.text());
-      const data = (await response.json()) as DirectorySelection;
-      if (data.selected && data.path) {
-        setPath(data.path);
-      }
+      const picked = await trySystemDirectoryPicker();
+      if (picked) setPath(picked);
+      else setDirectoryPickerOpen(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "选择目录失败");
+      setDirectoryPickerOpen(true);
     } finally {
       setSelectingDirectory(false);
     }
@@ -946,6 +1099,14 @@ function WorkspaceModal({
           </button>
         </footer>
       </section>
+      {directoryPickerOpen ? (
+        <DirectoryPickerModal
+          title="选择工作目录"
+          initialPath={path}
+          onSelect={setPath}
+          onClose={() => setDirectoryPickerOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }

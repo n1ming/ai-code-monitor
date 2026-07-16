@@ -1,0 +1,86 @@
+services:
+  mysql:
+    image: ${MYSQL_IMAGE:-docker.m.daocloud.io/library/mysql:8.4}
+    container_name: ai-code-monitor-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: ai_code_monitor
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./apps/server/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "${MYSQL_HOST_PORT:-13306}:3306"
+
+  server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-docker.m.daocloud.io/library/node:22-slim}
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-docker.m.daocloud.io/library/python:3.11-slim}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+        APT_MIRROR: ${APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian}
+        INSTALL_CODEX: ${INSTALL_CODEX:-true}
+        INSTALL_CLAUDE_CODE: ${INSTALL_CLAUDE_CODE:-false}
+    container_name: ai-code-monitor-server
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      CODE_MONITOR_DATABASE_URL: mysql+pymysql://root@mysql:3306/ai_code_monitor?charset=utf8mb4
+      AICM_LOG_ARCHIVE_ROOT: /app/data/log-archives
+      AICM_DEFAULT_LOG_LIMIT: "1000"
+      AICM_SYNC_TAIL_LINES: "5000"
+      AICM_SEARCH_ARCHIVES_BY_DEFAULT: "true"
+      AICM_ALLOWED_WORKSPACE_ROOTS: ${AICM_ALLOWED_WORKSPACE_ROOTS:-/workspaces,/app/data/workspaces}
+      AICM_SELECTED_AGENT: ${AICM_SELECTED_AGENT:-codex}
+      AICM_AGENT_BASE_URL: ${AICM_AGENT_BASE_URL:-}
+      AICM_AGENT_MODEL: ${AICM_AGENT_MODEL:-}
+      AICM_AGENT_YOLO: ${AICM_AGENT_YOLO:-true}
+      AICM_CODEX_PROVIDER: ${AICM_CODEX_PROVIDER:-custom}
+      AICM_CODEX_MODEL: ${AICM_AGENT_MODEL:-}
+      AICM_CODEX_API_KEY_ENV: OPENAI_API_KEY
+      AICM_CODEX_REQUIRES_OPENAI_AUTH: ${AICM_CODEX_REQUIRES_OPENAI_AUTH:-true}
+      OPENAI_BASE_URL: ${AICM_AGENT_BASE_URL:-}
+      OPENAI_API_KEY: ${AICM_AGENT_API_KEY:-}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-${AICM_AGENT_API_KEY:-}}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-${AICM_AGENT_BASE_URL:-}}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-${AICM_AGENT_API_KEY:-}}}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-${AICM_AGENT_MODEL:-}}
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: ${ANTHROPIC_DEFAULT_OPUS_MODEL:-}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ${ANTHROPIC_DEFAULT_SONNET_MODEL:-}
+    volumes:
+      - ./data:/app/data
+      - ${AICM_HOST_WORKSPACE_DIR:-./docker/workspaces}:/workspaces
+    ports:
+      - "8000:8000"
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NODE_IMAGE: ${WEB_NODE_IMAGE:-docker.m.daocloud.io/library/node:22-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-docker.m.daocloud.io/library/nginx:1.27-alpine}
+    container_name: ai-code-monitor-web
+    restart: unless-stopped
+    depends_on:
+      - server
+    ports:
+      - "8080:80"
+
+volumes:
+  mysql_data:

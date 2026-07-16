@@ -181,7 +181,7 @@ ai-code-monitor/
     server/
       app/
         main.py
-      .env
+      .env.example
     web/
       src/
         main.tsx
@@ -229,10 +229,10 @@ CREATE DATABASE ai_code_monitor CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
 
 ### 2. Configure Backend Environment
 
-Create or update:
+Copy the example configuration and edit it as needed:
 
-```text
-apps/server/.env
+```bash
+cp apps/server/.env.example apps/server/.env
 ```
 
 Example:
@@ -248,15 +248,23 @@ cd apps/web
 npm install
 ```
 
-### 4. Run Backend
+### 4. Install Backend Dependencies
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r apps/server/requirements.txt
+```
+
+### 5. Run Backend
 
 From the repository root:
 
 ```bash
-.venv/bin/uvicorn apps.server.app.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn apps.server.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-### 5. Run Frontend
+### 6. Run Frontend
 
 ```bash
 cd apps/web
@@ -268,6 +276,95 @@ Open:
 ```text
 http://127.0.0.1:5173
 ```
+
+## Docker Deployment
+
+The project includes Docker Compose configuration for MySQL, the backend API, and the frontend Nginx container:
+
+```bash
+./build-docker.sh
+```
+
+Open:
+
+```text
+http://127.0.0.1:8080
+```
+
+The backend container connects to the Compose MySQL service:
+
+```text
+mysql+pymysql://root@mysql:3306/ai_code_monitor?charset=utf8mb4
+```
+
+Note: Docker can only access paths inside the container or paths mounted into the container. The default workspace mounts are:
+
+```text
+./docker/workspaces -> /workspaces
+./data -> /app/data
+```
+
+To monitor other host project directories, do not hard-code local paths into the repository `docker-compose.yml`. When running `./build-docker.sh`, enter an optional extra host root. The script generates a local-only `docker-compose.override.yml`, which is ignored by Git.
+
+Docker and cloud server environments do not have a macOS Finder picker. When clicking "选择目录", the app falls back to browsing backend-allowed directories. By default, only these roots are allowed:
+
+```text
+/workspaces
+/app/data/workspaces
+```
+
+You can change them with:
+
+```env
+AICM_ALLOWED_WORKSPACE_ROOTS=/workspaces,/app/data/workspaces
+```
+
+The build script checks Docker, Docker Compose, occupied ports, and the npm mirror, then asks for:
+
+- `codex` or `claude code`
+- Agent API Base URL
+- Agent API Key
+- Agent model name
+- Whether to enable maximum-permission mode
+- Host workspace mount directory
+- Optional extra host root to browse and mount
+
+The script writes local runtime settings to `.env.docker.local` and optional volume overrides to `docker-compose.override.yml`. Both files are ignored by Git and are not release artifacts. The backend container injects the selected settings into the Agent:
+
+- Codex: writes an isolated `CODEX_HOME/config.toml` and uses `--dangerously-bypass-approvals-and-sandbox`
+- Claude Code: uses `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` and `--permission-mode bypassPermissions --dangerously-skip-permissions`
+
+The backend Docker image installs the selected Agent CLI through domestic mirrors:
+
+```text
+NPM_REGISTRY=https://registry.npmmirror.com
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
+INSTALL_CODEX=true
+INSTALL_CLAUDE_CODE=false
+```
+
+To try installing Claude Code CLI as well:
+
+```bash
+INSTALL_CLAUDE_CODE=true docker compose build server
+```
+
+Even when Claude Code installs successfully, login and API connectivity may still depend on your network environment, so it is not installed by default.
+
+Docker Compose also uses DaoCloud base-image mirrors by default:
+
+```bash
+NODE_IMAGE=docker.m.daocloud.io/library/node:22-slim \
+PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.11-slim \
+WEB_NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine \
+NGINX_IMAGE=docker.m.daocloud.io/library/nginx:1.27-alpine \
+MYSQL_IMAGE=docker.m.daocloud.io/library/mysql:8.4 \
+docker compose build
+```
+
+If your network can pull from Docker Hub directly, override these variables with the official image names.
 
 ## Build
 
