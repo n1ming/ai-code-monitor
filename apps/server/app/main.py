@@ -42,6 +42,49 @@ def _toml_quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _agent_subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith("CODEX_"):
+            env.pop(key, None)
+    return env
+
+
+def _codex_native_executable() -> str:
+    executable = shutil.which("codex")
+    if not executable:
+        return "codex"
+
+    resolved = Path(executable).resolve()
+    package_root = resolved.parent.parent if resolved.name == "codex.js" else resolved.parent
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    target_triple = ""
+    package_name = ""
+    if system == "darwin" and machine in {"arm64", "aarch64"}:
+        target_triple = "aarch64-apple-darwin"
+        package_name = "codex-darwin-arm64"
+    elif system == "darwin" and machine in {"x86_64", "amd64"}:
+        target_triple = "x86_64-apple-darwin"
+        package_name = "codex-darwin-x64"
+    elif system == "linux" and machine in {"x86_64", "amd64"}:
+        target_triple = "x86_64-unknown-linux-musl"
+        package_name = "codex-linux-x64"
+    elif system == "linux" and machine in {"arm64", "aarch64"}:
+        target_triple = "aarch64-unknown-linux-musl"
+        package_name = "codex-linux-arm64"
+
+    if target_triple and package_name:
+        candidates = [
+            package_root / "node_modules" / "@openai" / package_name / "vendor" / target_triple / "bin" / "codex",
+            package_root / "vendor" / target_triple / "bin" / "codex",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+    return executable
+
+
 class ProcessInfo(BaseModel):
     pid: int
     name: str | None = None
@@ -1387,6 +1430,9 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
 
         import json
         import os
+        import re
+        import shlex
+        import shutil
         import subprocess
         import time
         from datetime import datetime
@@ -1402,6 +1448,7 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
         RUNTIME_FILE = MONITOR_DIR / "app-runtime.json"
         HEARTBEAT_FILE = BRIDGE_DIR / "agent.heartbeat"
         COMMAND = {json.dumps(workspace.start_command)}
+        CODEX_EXECUTABLE = {json.dumps(_codex_native_executable())}
         PROCESS_ID = {json.dumps(process_ids.app)}
         AGENT_PROCESS_ID = {json.dumps(process_ids.agent)}
         POLL_SECONDS = {max(1, int(workspace.poll_seconds))}
@@ -1457,7 +1504,52 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
                 return {{}}
 
 
-        def write_runtime(pid: int, status: str) -> None:
+        SHELL_CONTROL_TOKENS = ("&&", "||", ";", "|", "<", ">", "`", "$(", "\\n")
+
+
+        def command_looks_executable(command: str) -> bool:
+            stripped = command.strip()
+            if not stripped:
+                return False
+            if any(token in stripped for token in SHELL_CONTROL_TOKENS):
+                return True
+            try:
+                parts = shlex.split(stripped)
+            except ValueError:
+                return False
+            index = 0
+            while index < len(parts) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", parts[index]):
+                index += 1
+            if index >= len(parts):
+                return False
+            executable = parts[index]
+            if "/" in executable:
+                return Path(executable).expanduser().exists()
+            return shutil.which(executable) is not None
+
+
+        def startup_mode() -> str:
+            return "shell" if command_looks_executable(COMMAND) else "instruction"
+
+
+        def build_instruction_prompt() -> str:
+            return (
+                "你是 ai-code-monitor 启动的后台 App worker。\\n"
+                f"工作区路径：{{ROOT}}\\n"
+                f"app process_id：{{PROCESS_ID}}\\n"
+                f"触发方 agent process_id：{{AGENT_PROCESS_ID}}\\n"
+                "用户启动意图如下，不要把它当 shell 命令；请把它作为任务说明理解并执行：\\n"
+                f"{{COMMAND}}\\n\\n"
+                "执行要求：\\n"
+                "1. 先读取工作区内被启动意图引用的记忆、交接文档或脚本，再继续执行任务。\\n"
+                "2. 需要启动真实脚本、代理或采集任务时，由你自行选择正确命令和工作目录。\\n"
+                "3. 你可以修改代码；只要修改了代码，必须同步更新相关记忆/交接文件。\\n"
+                "4. 所有关键进展、启动的子进程 OS PID、失败原因和验证结果都要写入 .ai-code-monitor/logs/app.out.log。\\n"
+                "5. 持续执行和监控任务，不要只阅读文件或只输出总结。\\n"
+            )
+
+
+        def write_runtime(pid: int, status: str, mode: str | None = None, error_message: str | None = None) -> None:
             existing = read_runtime()
             started_at = existing.get("started_at") if existing.get("os_pid") == pid else now()
             payload = {{
@@ -1471,7 +1563,10 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
                 "log_file": str(APP_LOG),
                 "watchdog_pid": os.getpid(),
                 "watchdog_status": "running",
+                "startup_mode": mode or startup_mode(),
             }}
+            if error_message:
+                payload["error_message"] = error_message
             MONITOR_DIR.mkdir(parents=True, exist_ok=True)
             RUNTIME_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
 
@@ -1482,25 +1577,61 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
 
 
         def start_app() -> int:
-            append_app_log("INFO", f"{{PROCESS_ID}} 启动应用命令: {{COMMAND}}，触发方 agent process_id: {{AGENT_PROCESS_ID}}")
+            mode = startup_mode()
+            append_app_log("INFO", f"{{PROCESS_ID}} 启动应用，mode={{mode}}，启动内容: {{COMMAND}}，触发方 agent process_id: {{AGENT_PROCESS_ID}}")
             output = APP_LOG.open("ab", buffering=0)
-            process = subprocess.Popen(
-                COMMAND,
-                cwd=str(ROOT),
-                shell=True,
-                stdin=subprocess.DEVNULL,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                close_fds=True,
-            )
+            child_env = os.environ.copy()
+            for key in list(child_env):
+                if key.startswith("CODEX_"):
+                    child_env.pop(key, None)
+            if mode == "shell":
+                popen_command: object = COMMAND
+                shell = True
+                stdin = subprocess.DEVNULL
+            else:
+                codex = CODEX_EXECUTABLE if Path(CODEX_EXECUTABLE).exists() else shutil.which("codex")
+                if not codex:
+                    message = "自然语言启动需要 Codex CLI，但当前环境找不到 codex 可执行文件。"
+                    log("ERROR", message)
+                    append_app_log("ERROR", message)
+                    write_runtime(os.getpid(), "failed", mode, message)
+                    return os.getpid()
+                popen_command = [
+                    codex,
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-C",
+                    str(ROOT),
+                    build_instruction_prompt(),
+                ]
+                shell = False
+                stdin = subprocess.DEVNULL
+            try:
+                process = subprocess.Popen(
+                    popen_command,
+                    cwd=str(ROOT),
+                    shell=shell,
+                    stdin=stdin,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    env=child_env,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except OSError as exc:
+                message = f"应用启动失败，mode={{mode}}，错误: {{exc}}"
+                log("ERROR", message)
+                append_app_log("ERROR", message)
+                write_runtime(os.getpid(), "failed", mode, message)
+                return os.getpid()
             time.sleep(1)
             if pid_alive(process.pid):
-                log("SUCCESS", f"应用进程已启动，app process_id: {{PROCESS_ID}}，OS PID: {{process.pid}}，启动命令: {{COMMAND}}")
-                write_runtime(process.pid, "running")
+                log("SUCCESS", f"应用进程已启动，app process_id: {{PROCESS_ID}}，OS PID: {{process.pid}}，mode={{mode}}，启动内容: {{COMMAND}}")
+                write_runtime(process.pid, "running", mode)
             else:
-                log("ERROR", f"应用进程启动后不可达，app process_id: {{PROCESS_ID}}，OS PID: {{process.pid}}，启动命令: {{COMMAND}}")
-                write_runtime(process.pid, "exited")
+                log("ERROR", f"应用进程启动后不可达，app process_id: {{PROCESS_ID}}，OS PID: {{process.pid}}，mode={{mode}}，启动内容: {{COMMAND}}")
+                write_runtime(process.pid, "exited", mode, "应用进程启动后立即退出。")
             return process.pid
 
 
@@ -1627,16 +1758,18 @@ def _agent_runtime_command(workspace: Workspace) -> str:
     command = workspace.agent_command.strip()
     selected_agent = os.getenv("AICM_SELECTED_AGENT", "").strip().lower()
     if command == "codex" or (not command and selected_agent == "codex"):
+        codex = shlex.quote(_codex_native_executable())
         if _env_bool("AICM_AGENT_YOLO", True):
-            return "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox {prompt}"
+            return f"{codex} --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
         sandbox = "workspace-write" if workspace.ai_can_edit else "read-only"
-        return f"codex --no-alt-screen -a never -s {sandbox} {{prompt}}"
+        return f"{codex} --no-alt-screen -a never -s {sandbox}"
     try:
         parts = shlex.split(command)
     except ValueError:
         return command
     has_prompt_placeholder = any("{prompt}" in part or "{prompt_file}" in part for part in parts)
     if parts and Path(parts[0]).name == "codex" and not has_prompt_placeholder:
+        parts[0] = _codex_native_executable()
         has_yolo = "--dangerously-bypass-approvals-and-sandbox" in parts
         has_approval = any(part == "-a" or part == "--ask-for-approval" or part.startswith("--ask-for-approval=") for part in parts)
         has_sandbox = any(part == "-s" or part == "--sandbox" or part.startswith("--sandbox=") for part in parts)
@@ -1649,7 +1782,6 @@ def _agent_runtime_command(workspace: Workspace) -> str:
                 parts.extend(["-a", "never"])
             if not has_sandbox:
                 parts.extend(["-s", "workspace-write" if workspace.ai_can_edit else "read-only"])
-        parts.append("{prompt}")
         return shlex.join(parts)
     if parts and Path(parts[0]).name == "claude" and not has_prompt_placeholder:
         has_permission_mode = any(part == "--permission-mode" or part.startswith("--permission-mode=") for part in parts)
@@ -1684,6 +1816,7 @@ def _monitor_script_source() -> str:
         import shlex
         import signal
         import subprocess
+        import sys
         import time
         from datetime import datetime
         from pathlib import Path
@@ -1829,6 +1962,110 @@ def _monitor_script_source() -> str:
             return True
 
 
+        def pid_alive(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                return False
+            return True
+
+
+        def read_app_runtime() -> dict[str, object] | None:
+            try:
+                payload = json.loads(APP_RUNTIME_FILE.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            return payload if isinstance(payload, dict) else None
+
+
+        def app_runtime_running() -> bool:
+            payload = read_app_runtime()
+            if not payload or payload.get("status") != "running":
+                return False
+            os_pid = payload.get("os_pid")
+            return isinstance(os_pid, int) and pid_alive(os_pid)
+
+
+        def launcher_needed(issue: str) -> bool:
+            return (
+                "未找到或无法读取 App runtime 文件" in issue
+                or "App runtime 未记录有效 OS PID" in issue
+                or "不存在，说明启动脚本已经停止" in issue
+                or "App 日志文件不存在" in issue
+            )
+
+
+        def app_launcher_env() -> dict[str, str]:
+            env = dict(os.environ)
+            for key in list(env):
+                if key.startswith("CODEX_"):
+                    env.pop(key, None)
+            return env
+
+
+        def launch_app_via_launcher(reason: str) -> bool:
+            if app_runtime_running():
+                return True
+            launcher = Path.cwd() / "app_launcher.py"
+            if not launcher.exists():
+                message = f"无法通过启动链路恢复 App：找不到 {launcher}"
+                log("ERROR", message)
+                agent_event("ERROR", message)
+                return False
+
+            APP_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            log("INFO", f"通过 app_launcher.py 启动 App，原因: {reason}")
+            agent_event("INFO", f"系统直接执行 python app_launcher.py 启动 App，原因: {reason}")
+            with APP_LOG_FILE.open("ab") as output:
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, str(launcher)],
+                        cwd=str(Path.cwd()),
+                        stdin=subprocess.DEVNULL,
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                        env=app_launcher_env(),
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                except OSError as exc:
+                    message = f"执行 python app_launcher.py 失败: {exc}"
+                    log("ERROR", message)
+                    agent_event("ERROR", message)
+                    return False
+
+                try:
+                    return_code = process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    log("WARNING", f"app_launcher.py 未在 10 秒内退出，OS PID: {process.pid}")
+                    return_code = None
+
+            if return_code not in (0, None):
+                message = f"app_launcher.py 退出码异常: {return_code}"
+                log("ERROR", message)
+                agent_event("ERROR", message)
+                return False
+
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if app_runtime_running():
+                    payload = read_app_runtime() or {}
+                    os_pid = payload.get("os_pid")
+                    log("SUCCESS", f"App runtime 已恢复 running，OS PID: {os_pid}")
+                    agent_event("SUCCESS", f"系统通过 app_launcher.py 恢复 App，OS PID: {os_pid}")
+                    return True
+                time.sleep(0.5)
+
+            issue = app_issue() or "未知原因"
+            log("ERROR", f"app_launcher.py 已执行但 App runtime 未恢复: {issue}")
+            agent_event("ERROR", f"app_launcher.py 已执行但 App runtime 未恢复: {issue}")
+            return False
+
+
         def heartbeat_stale() -> bool:
             try:
                 modified_at = AGENT_HEARTBEAT.stat().st_mtime
@@ -1838,10 +2075,16 @@ def _monitor_script_source() -> str:
 
 
         def app_issue() -> str | None:
-            try:
-                payload = json.loads(APP_RUNTIME_FILE.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            payload = read_app_runtime()
+            if payload is None:
                 return f"未找到或无法读取 App runtime 文件: {APP_RUNTIME_FILE}"
+
+            status = payload.get("status")
+            if status and status != "running":
+                detail = payload.get("error_message")
+                if detail:
+                    return f"App runtime 状态为 {status}: {detail}"
+                return f"App runtime 状态为 {status}: {payload!r}"
 
             os_pid = payload.get("os_pid")
             if not isinstance(os_pid, int):
@@ -1897,6 +2140,8 @@ def _monitor_script_source() -> str:
                 log("SUCCESS", f"初始化提示词已发送给 Agent，OS PID: {agent_process.pid}")
                 agent_event("SUCCESS", f"初始化提示词已通过 PTY 发送给 Agent，OS PID: {agent_process.pid}")
 
+            last_launcher_attempt_at = time.time()
+            launch_app_via_launcher("初始化后立即执行启动链路")
             next_poll_at = time.time() + POLL_SECONDS
             while RUNNING:
                 drain_agent_output(master_fd)
@@ -1918,11 +2163,16 @@ def _monitor_script_source() -> str:
                         agent_event("SUCCESS", f"Agent 已重启并接收初始化提示词，OS PID: {agent_process.pid}")
                     else:
                         send_to_agent(master_fd, INITIAL_PROMPT)
+                    last_launcher_attempt_at = time.time()
+                    launch_app_via_launcher("Agent 重启后恢复启动链路")
                     next_poll_at = time.time() + POLL_SECONDS
 
                 if time.time() >= next_poll_at:
                     issue = app_issue()
                     if issue:
+                        if launcher_needed(issue) and time.time() - last_launcher_attempt_at >= max(POLL_SECONDS * 3, 15):
+                            last_launcher_attempt_at = time.time()
+                            launch_app_via_launcher(issue)
                         prompt = (
                             "继续\n"
                             f"检测到 App 运行异常：{issue}\n"
@@ -2137,7 +2387,7 @@ def _start_workspace_processes(db: Session, workspace: Workspace) -> None:
     agent_command = _agent_runtime_command(workspace)
     _ensure_agent_command_available(agent_command)
     monitor_env = {
-        **os.environ,
+        **_agent_subprocess_env(),
         "AICM_WORKSPACE_NAME": workspace.name,
         "AICM_POLL_SECONDS": str(workspace.poll_seconds),
         "AICM_AGENT_COMMAND": agent_command,
