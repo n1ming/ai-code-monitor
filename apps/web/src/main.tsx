@@ -642,19 +642,17 @@ function LogRecordView({ raw }: { raw: string }) {
   const record = React.useMemo(() => parseLogRecord(raw), [raw]);
   const levelClass = logLevelClass(record.level);
   const detailsClass = `log-entry ${levelClass}${record.collapsible ? " collapsible" : ""}${record.codeLike ? " code" : ""}`;
-  const meta = (
-    <div className="log-entry-head">
-      <span className={`log-pill ${levelClass}`}>{record.level}</span>
-      {record.timestamp ? <time className="log-timestamp">{record.timestamp}</time> : null}
-      <span className="log-summary">{record.summary}</span>
-      {record.collapsible ? <span className="log-line-count">{record.lineCount} 行</span> : null}
-    </div>
-  );
 
-  if (!record.collapsible) {
+  if (!record.codeLike) {
     return (
       <article className={detailsClass}>
-        {meta}
+        <div className="log-entry-head">
+          <span className={`log-pill ${levelClass}`}>{record.level}</span>
+          {record.timestamp ? <time className="log-timestamp">{record.timestamp}</time> : null}
+        </div>
+        <div className="log-entry-body">
+          <div className="log-text-block">{record.body}</div>
+        </div>
       </article>
     );
   }
@@ -710,7 +708,7 @@ function parseLogRecord(value: string): ParsedLogRecord {
   const summaryText = previewLines.join(" ");
   const summary = summaryText.length > 160 ? `${summaryText.slice(0, 160)}…` : summaryText;
   const codeLike = looksLikeCodeBlock(normalizedBody);
-  const collapsible = codeLike || lineCount > 1 || normalizedBody.length > 240;
+  const collapsible = codeLike;
 
   return {
     timestamp,
@@ -739,9 +737,9 @@ function logLevelClass(level: string) {
 function looksLikeCodeBlock(text: string) {
   if (!text) return false;
   if (text.includes("```")) return true;
-  if (text.split("\n").length > 1) return true;
-  if (text.length > 280) return true;
-  return /(?:^|\s)(?:function|class|const|let|var|import|export|SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|if\s*\(|for\s*\(|while\s*\(|=>|def\s+|return\s+|print\(|console\.|async\s+function)\b/i.test(text);
+  const keywordLike = /(?:^|\s)(?:function|class|const|let|var|import|export|SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|if\s*\(|for\s*\(|while\s*\(|def\s+|return\s+|print\(|console\.|async\s+function)\b/i.test(text);
+  const syntaxLike = (text.includes("=>") || /<\/?\w+[\s>]/.test(text) || /[{};]/.test(text)) && /(?:=|:|\(|\)|;|=>)/.test(text);
+  return keywordLike || syntaxLike;
 }
 
 function ConfirmDeleteModal({

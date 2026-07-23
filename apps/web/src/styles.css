@@ -505,8 +505,8 @@ h1, h2, h3, p { margin: 0; }
   max-height: 260px;
   overflow: auto;
   display: grid;
-  gap: 10px;
-  padding: 12px;
+  gap: 5px;
+  padding: 10px 12px;
   border: 1px solid #d4dce7;
   border-radius: 8px;
   color: #dce7f6;
@@ -545,28 +545,32 @@ h1, h2, h3, p { margin: 0; }
 }
 
 .log-entry {
-  overflow: hidden;
-  padding: 10px 12px;
-  border: 1px solid #263244;
-  border-radius: 8px;
-  background: #0f1720;
+  padding: 3px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   color: #dce7f6;
 }
 
 .log-entry.error {
-  border-color: rgba(255, 123, 123, .42);
+  color: #ffb5b5;
 }
 
 .log-entry.warn {
-  border-color: rgba(255, 209, 102, .32);
+  color: #ffd88d;
 }
 
 .log-entry.debug {
-  border-color: rgba(118, 169, 255, .32);
+  color: #99bcff;
 }
 
 .log-entry.success {
-  border-color: rgba(95, 224, 143, .3);
+  color: #a6f0bf;
+}
+
+.log-entry.code {
+  padding: 0;
+  color: #dce7f6;
 }
 
 .log-entry summary {
@@ -583,6 +587,13 @@ h1, h2, h3, p { margin: 0; }
   align-items: flex-start;
   gap: 8px;
   min-width: 0;
+}
+
+.log-entry.code summary {
+  padding: 6px 8px;
+  border: 1px solid #263244;
+  border-radius: 8px;
+  background: #0f1720;
 }
 
 .log-disclosure {
@@ -655,23 +666,24 @@ h1, h2, h3, p { margin: 0; }
 }
 
 .log-entry-body {
-  margin-top: 9px;
+  margin-top: 2px;
 }
 
 .log-text-block {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
-  color: #dce7f6;
+  color: inherit;
 }
 
 .log-code-block {
-  margin: 0;
-  padding: 10px 12px;
+  margin: 6px 0 0;
+  padding: 8px 10px;
   border: 1px solid #2d3a4e;
   border-radius: 8px;
   overflow: auto;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   color: #dce7f6;
   background: #0b1320;
   scrollbar-gutter: stable;

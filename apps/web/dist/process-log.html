@@ -102,8 +102,8 @@
         overflow: auto;
         display: grid;
         align-content: start;
-        gap: 10px;
-        padding: 12px;
+        gap: 5px;
+        padding: 10px 12px;
         border: 1px solid #263244;
         border-radius: 8px;
         background: #111827;
@@ -132,17 +132,20 @@
         background: rgba(255, 209, 102, .16);
       }
       .log-entry {
-        overflow: hidden;
-        padding: 10px 12px;
-        border: 1px solid #263244;
-        border-radius: 8px;
-        background: #0f1720;
+        padding: 3px 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
         color: #dce7f6;
       }
-      .log-entry.error { border-color: rgba(255, 123, 123, .42); }
-      .log-entry.warn { border-color: rgba(255, 209, 102, .32); }
-      .log-entry.debug { border-color: rgba(118, 169, 255, .32); }
-      .log-entry.success { border-color: rgba(95, 224, 143, .3); }
+      .log-entry.error { color: #ffb5b5; }
+      .log-entry.warn { color: #ffd88d; }
+      .log-entry.debug { color: #99bcff; }
+      .log-entry.success { color: #a6f0bf; }
+      .log-entry.code {
+        padding: 0;
+        color: #dce7f6;
+      }
       .log-entry summary {
         list-style: none;
         cursor: pointer;
@@ -153,6 +156,12 @@
         align-items: flex-start;
         gap: 8px;
         min-width: 0;
+      }
+      .log-entry.code summary {
+        padding: 6px 8px;
+        border: 1px solid #263244;
+        border-radius: 8px;
+        background: #0f1720;
       }
       .log-pill, .log-type {
         display: inline-flex;
@@ -184,20 +193,22 @@
         word-break: break-word;
       }
       .log-body {
-        margin-top: 9px;
+        margin-top: 2px;
       }
       .log-text {
         white-space: pre-wrap;
         overflow-wrap: anywhere;
         word-break: break-word;
+        color: inherit;
       }
       .log-code {
-        margin: 0;
-        padding: 10px 12px;
+        margin: 6px 0 0;
+        padding: 8px 10px;
         border: 1px solid #2d3a4e;
         border-radius: 8px;
         overflow: auto;
-        white-space: pre;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
         color: #dce7f6;
         background: #0b1320;
         scrollbar-gutter: stable;
@@ -354,13 +365,13 @@
       function looksLikeCodeBlock(text) {
         if (!text) return false;
         if (text.includes("```")) return true;
-        if (text.split("\n").length > 1) return true;
-        if (text.length > 280) return true;
-        return /(?:^|\s)(?:function|class|const|let|var|import|export|SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|if\s*\(|for\s*\(|while\s*\(|=>|def\s+|return\s+|print\(|console\.|async\s+function)\b/i.test(text);
+        const keywordLike = /(?:^|\s)(?:function|class|const|let|var|import|export|SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|if\s*\(|for\s*\(|while\s*\(|def\s+|return\s+|print\(|console\.|async\s+function)\b/i.test(text);
+        const syntaxLike = (text.includes("=>") || /<\/?\w+[\s>]/.test(text) || /[{};]/.test(text)) && /(?:=|:|\(|\)|;|=>)/.test(text);
+        return keywordLike || syntaxLike;
       }
 
       function parseLogItem(item) {
-        const clean = cleanLogText(item.content || "").trim();
+        const clean = cleanLogText(item.content || "").trimEnd();
         const lines = clean.split("\n");
         const firstLine = lines[0] || "";
         const prefix = firstLine.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(ERROR|WARNING|WARN|DEBUG|SUCCESS|INFO)\s+(.*)$/s);
@@ -385,7 +396,7 @@
           body,
           summary: summary || body.slice(0, 160),
           lineCount,
-          collapsible: codeLike || lineCount > 1 || body.length > 240,
+          collapsible: codeLike,
           codeLike,
         };
       }
@@ -399,14 +410,16 @@
         return span;
       }
 
-      function createLogHead(record) {
+      function createLogHead(record, includeSummary) {
         const head = document.createElement("div");
         head.className = "log-head";
         appendText(head, `log-pill ${record.levelClass}`, record.level);
         appendText(head, "log-time", record.timestamp);
         appendText(head, "log-type", record.type);
-        appendText(head, "log-summary", record.summary || "(empty)");
-        if (record.collapsible) appendText(head, "log-lines", `${record.lineCount} 行`);
+        if (includeSummary) {
+          appendText(head, "log-summary", record.summary || "(empty)");
+          appendText(head, "log-lines", `${record.lineCount} 行`);
+        }
         return head;
       }
 
@@ -422,15 +435,22 @@
 
       function renderLogItem(item) {
         const record = parseLogItem(item);
-        const element = document.createElement(record.collapsible ? "details" : "article");
-        element.className = `log-entry ${record.levelClass}${record.collapsible ? " collapsible" : ""}${record.codeLike ? " code" : ""}`;
-        if (record.collapsible) {
+        const element = document.createElement(record.codeLike ? "details" : "article");
+        element.className = `log-entry ${record.levelClass}${record.codeLike ? " collapsible code" : ""}`;
+        if (record.codeLike) {
           const summary = document.createElement("summary");
-          summary.appendChild(createLogHead(record));
+          summary.appendChild(createLogHead(record, true));
           element.appendChild(summary);
           element.appendChild(createLogBody(record));
         } else {
-          element.appendChild(createLogHead(record));
+          element.appendChild(createLogHead(record, false));
+          const body = document.createElement("div");
+          body.className = "log-body";
+          const text = document.createElement("div");
+          text.className = "log-text";
+          text.textContent = record.body;
+          body.appendChild(text);
+          element.appendChild(body);
         }
         return element;
       }
