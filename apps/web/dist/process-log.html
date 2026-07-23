@@ -39,7 +39,7 @@
         color: #8da2bc;
         font-size: 11px;
       }
-      input, select {
+      input, select, button {
         min-height: 32px;
         border: 1px solid #344258;
         border-radius: 6px;
@@ -48,6 +48,21 @@
         font: inherit;
       }
       input, select { width: 132px; padding: 0 8px; }
+      button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        width: auto;
+        padding: 0 10px;
+        cursor: pointer;
+        font-weight: 750;
+        white-space: nowrap;
+      }
+      button.primary {
+        border-color: #3274a7;
+        background: #215d8a;
+      }
       input[type="number"] { width: 86px; }
       input[type="search"] { width: 180px; }
       input[type="date"] { width: 142px; }
@@ -83,17 +98,110 @@
       }
       main { padding: 14px 18px 24px; }
       .terminal {
-        min-height: calc(100vh - 96px);
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
+        height: calc(100vh - 112px);
+        overflow: auto;
+        display: grid;
+        align-content: start;
+        gap: 10px;
+        padding: 12px;
+        border: 1px solid #263244;
+        border-radius: 8px;
+        background: #111827;
         font-size: 12px;
         line-height: 1.65;
+        scrollbar-gutter: stable;
+        overscroll-behavior: contain;
       }
-      .line.error { color: #ff7b7b; }
-      .line.debug { color: #76a9ff; }
-      .line.success { color: #5fe08f; }
-      .line.warn { color: #ffd166; }
-      .line.info { color: #f3f7fb; }
+      .terminal.paused {
+        border-color: #61708a;
+        box-shadow: inset 0 0 0 1px rgba(124, 145, 172, .22);
+      }
+      .log-state {
+        display: inline-flex;
+        align-items: center;
+        min-height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        color: #a6f0bf;
+        background: rgba(95, 224, 143, .14);
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .log-state.paused {
+        color: #ffd88d;
+        background: rgba(255, 209, 102, .16);
+      }
+      .log-entry {
+        overflow: hidden;
+        padding: 10px 12px;
+        border: 1px solid #263244;
+        border-radius: 8px;
+        background: #0f1720;
+        color: #dce7f6;
+      }
+      .log-entry.error { border-color: rgba(255, 123, 123, .42); }
+      .log-entry.warn { border-color: rgba(255, 209, 102, .32); }
+      .log-entry.debug { border-color: rgba(118, 169, 255, .32); }
+      .log-entry.success { border-color: rgba(95, 224, 143, .3); }
+      .log-entry summary {
+        list-style: none;
+        cursor: pointer;
+      }
+      .log-entry summary::-webkit-details-marker { display: none; }
+      .log-head {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        min-width: 0;
+      }
+      .log-pill, .log-type {
+        display: inline-flex;
+        align-items: center;
+        min-height: 20px;
+        padding: 0 7px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 850;
+        letter-spacing: 0;
+        white-space: nowrap;
+      }
+      .log-pill.error { color: #ffb5b5; background: rgba(255, 123, 123, .16); }
+      .log-pill.warn { color: #ffd88d; background: rgba(255, 209, 102, .16); }
+      .log-pill.debug { color: #99bcff; background: rgba(118, 169, 255, .16); }
+      .log-pill.success { color: #a6f0bf; background: rgba(95, 224, 143, .14); }
+      .log-pill.info { color: #e6efff; background: rgba(243, 247, 251, .1); }
+      .log-type { color: #9eb1c8; background: rgba(141, 162, 188, .12); }
+      .log-time, .log-lines {
+        flex: 0 0 auto;
+        color: #8da2bc;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+      .log-summary {
+        min-width: 0;
+        color: #f3f7fb;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      .log-body {
+        margin-top: 9px;
+      }
+      .log-text {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      .log-code {
+        margin: 0;
+        padding: 10px 12px;
+        border: 1px solid #2d3a4e;
+        border-radius: 8px;
+        overflow: auto;
+        white-space: pre;
+        color: #dce7f6;
+        background: #0b1320;
+        scrollbar-gutter: stable;
+      }
       @media (max-width: 900px) {
         header {
           align-items: stretch;
@@ -156,6 +264,10 @@
           <input id="includeArchive" type="checkbox" />
           归档
         </label>
+        <span class="log-state" id="refreshState">自动刷新</span>
+        <button id="refreshNow" type="button">立即刷新</button>
+        <button id="pauseRefresh" type="button">暂停刷新</button>
+        <button id="jumpBottom" class="primary" type="button">回到底部</button>
       </div>
     </header>
     <main>
@@ -184,7 +296,13 @@
       const endTime = document.getElementById("endTime");
       const keyword = document.getElementById("keyword");
       const includeArchive = document.getElementById("includeArchive");
+      const refreshState = document.getElementById("refreshState");
+      const refreshNow = document.getElementById("refreshNow");
+      const pauseRefresh = document.getElementById("pauseRefresh");
+      const jumpBottom = document.getElementById("jumpBottom");
       let filterTimer = null;
+      let refreshPaused = false;
+      let lastLoadedSignature = "";
 
       title.textContent = `${displayRole} 日志 - ${processId}`;
       meta.textContent = workspaceId;
@@ -202,23 +320,141 @@
       applyDateTimeParam("start", startDate, startTime);
       applyDateTimeParam("end", endDate, endTime);
 
-      function cleanLogLine(line) {
+      function cleanLogText(line) {
         return String(line)
           .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)?/g, "")
           .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
           .replace(/\x1b/g, "")
+          .replace(/\r\n?/g, "\n")
           .replace(/^\s*\d{1,3}(?:\s+|(?=[^\d\s]))/, "")
           .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
-          .trim();
+          .trimEnd();
       }
 
-      function lineClass(line) {
-        const upper = line.toUpperCase();
-        if (upper.includes(" ERROR ")) return "line error";
-        if (upper.includes(" DEBUG ")) return "line debug";
-        if (upper.includes(" SUCCESS ")) return "line success";
-        if (upper.includes(" WARN ") || upper.includes(" WARNING ")) return "line warn";
-        return "line info";
+      function normalizeLevel(level) {
+        const normalized = String(level || "INFO").toUpperCase();
+        return normalized === "WARN" ? "WARNING" : normalized;
+      }
+
+      function levelClass(level) {
+        const normalized = normalizeLevel(level);
+        if (normalized === "ERROR") return "error";
+        if (normalized === "WARNING") return "warn";
+        if (normalized === "DEBUG") return "debug";
+        if (normalized === "SUCCESS") return "success";
+        return "info";
+      }
+
+      function formatTimestamp(value) {
+        const text = String(value || "").trim();
+        const match = text.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+        return match ? `${match[1]} ${match[2]}` : text;
+      }
+
+      function looksLikeCodeBlock(text) {
+        if (!text) return false;
+        if (text.includes("```")) return true;
+        if (text.split("\n").length > 1) return true;
+        if (text.length > 280) return true;
+        return /(?:^|\s)(?:function|class|const|let|var|import|export|SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|if\s*\(|for\s*\(|while\s*\(|=>|def\s+|return\s+|print\(|console\.|async\s+function)\b/i.test(text);
+      }
+
+      function parseLogItem(item) {
+        const clean = cleanLogText(item.content || "").trim();
+        const lines = clean.split("\n");
+        const firstLine = lines[0] || "";
+        const prefix = firstLine.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(ERROR|WARNING|WARN|DEBUG|SUCCESS|INFO)\s+(.*)$/s);
+        let body = clean;
+        if (prefix) {
+          body = [prefix[3], ...lines.slice(1)].join("\n").trim();
+        }
+        const level = normalizeLevel(item.level || (prefix ? prefix[2] : "INFO"));
+        const lineCount = body ? body.split("\n").length : 0;
+        const summarySource = body
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .join(" ");
+        const summary = summarySource.length > 160 ? `${summarySource.slice(0, 160)}...` : summarySource;
+        const codeLike = looksLikeCodeBlock(body);
+        return {
+          level,
+          levelClass: levelClass(level),
+          timestamp: formatTimestamp(item.occurred_at),
+          type: item.log_type || "",
+          body,
+          summary: summary || body.slice(0, 160),
+          lineCount,
+          collapsible: codeLike || lineCount > 1 || body.length > 240,
+          codeLike,
+        };
+      }
+
+      function appendText(parent, className, text) {
+        if (!text) return null;
+        const span = document.createElement("span");
+        span.className = className;
+        span.textContent = text;
+        parent.appendChild(span);
+        return span;
+      }
+
+      function createLogHead(record) {
+        const head = document.createElement("div");
+        head.className = "log-head";
+        appendText(head, `log-pill ${record.levelClass}`, record.level);
+        appendText(head, "log-time", record.timestamp);
+        appendText(head, "log-type", record.type);
+        appendText(head, "log-summary", record.summary || "(empty)");
+        if (record.collapsible) appendText(head, "log-lines", `${record.lineCount} 行`);
+        return head;
+      }
+
+      function createLogBody(record) {
+        const body = document.createElement("div");
+        body.className = "log-body";
+        const content = document.createElement(record.codeLike ? "pre" : "div");
+        content.className = record.codeLike ? "log-code" : "log-text";
+        content.textContent = record.body;
+        body.appendChild(content);
+        return body;
+      }
+
+      function renderLogItem(item) {
+        const record = parseLogItem(item);
+        const element = document.createElement(record.collapsible ? "details" : "article");
+        element.className = `log-entry ${record.levelClass}${record.collapsible ? " collapsible" : ""}${record.codeLike ? " code" : ""}`;
+        if (record.collapsible) {
+          const summary = document.createElement("summary");
+          summary.appendChild(createLogHead(record));
+          element.appendChild(summary);
+          element.appendChild(createLogBody(record));
+        } else {
+          element.appendChild(createLogHead(record));
+        }
+        return element;
+      }
+
+      function isTerminalAtBottom() {
+        return terminal.scrollTop + terminal.clientHeight >= terminal.scrollHeight - 32;
+      }
+
+      function scrollTerminalToBottom() {
+        terminal.scrollTop = terminal.scrollHeight;
+      }
+
+      function selectionInsideTerminal() {
+        const selection = window.getSelection();
+        if (!selection || selection.isCollapsed) return false;
+        return Boolean(selection.anchorNode && terminal.contains(selection.anchorNode));
+      }
+
+      function setRefreshPaused(next) {
+        refreshPaused = next;
+        terminal.classList.toggle("paused", refreshPaused);
+        refreshState.classList.toggle("paused", refreshPaused);
+        refreshState.textContent = refreshPaused ? "刷新已暂停" : "自动刷新";
+        pauseRefresh.textContent = refreshPaused ? "恢复刷新" : "暂停刷新";
       }
 
       function combineDateTime(dateInput, timeInput, boundary) {
@@ -228,8 +464,14 @@
         return `${dateInput.value}T${time}`;
       }
 
-      async function loadLogs() {
-        const shouldStickToBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 40;
+      async function loadLogs(manual = false) {
+        if (!manual && refreshPaused) return;
+        if (!manual && selectionInsideTerminal()) {
+          setRefreshPaused(true);
+          return;
+        }
+        const shouldStickToBottom = isTerminalAtBottom();
+        const previousTop = terminal.scrollTop;
         if (!terminal.dataset.loaded) terminal.textContent = "Loading...";
         const limit = limitInput.value || "1000";
         const query = new URLSearchParams({ limit });
@@ -249,22 +491,31 @@
           return;
         }
         const data = await response.json();
-        terminal.innerHTML = "";
+        const signature = data.items
+          .map((item) => `${item.log_id}:${item.occurred_at}:${String(item.content || "").length}`)
+          .join("|");
+        if (signature === lastLoadedSignature) {
+          terminal.dataset.loaded = "true";
+          return;
+        }
+        lastLoadedSignature = signature;
+        terminal.replaceChildren();
         for (const item of data.items) {
-          const line = cleanLogLine(item.content);
-          if (!line) continue;
-          const div = document.createElement("div");
-          div.className = lineClass(line);
-          div.textContent = line;
-          terminal.appendChild(div);
+          const clean = cleanLogText(item.content || "").trim();
+          if (!clean) continue;
+          terminal.appendChild(renderLogItem(item));
         }
         terminal.dataset.loaded = "true";
-        if (shouldStickToBottom) window.scrollTo(0, document.body.scrollHeight);
+        if (shouldStickToBottom || manual) {
+          scrollTerminalToBottom();
+        } else {
+          terminal.scrollTop = previousTop;
+        }
       }
 
       function scheduleLoad() {
         window.clearTimeout(filterTimer);
-        filterTimer = window.setTimeout(() => void loadLogs(), 250);
+        filterTimer = window.setTimeout(() => void loadLogs(true), 250);
       }
 
       async function loadSettings() {
@@ -310,11 +561,43 @@
         element.addEventListener("input", scheduleLoad);
         element.addEventListener("change", scheduleLoad);
       }
+
+      terminal.addEventListener("scroll", () => {
+        if (isTerminalAtBottom()) {
+          if (refreshPaused) setRefreshPaused(false);
+          return;
+        }
+        if (!refreshPaused) setRefreshPaused(true);
+      });
+
+      terminal.addEventListener("mouseup", () => {
+        if (selectionInsideTerminal()) setRefreshPaused(true);
+      });
+
+      terminal.addEventListener("copy", () => {
+        setRefreshPaused(true);
+      });
+
+      refreshNow.addEventListener("click", () => void loadLogs(true));
+      pauseRefresh.addEventListener("click", () => {
+        const next = !refreshPaused;
+        setRefreshPaused(next);
+        if (!next) void loadLogs(true);
+      });
+      jumpBottom.addEventListener("click", () => {
+        setRefreshPaused(false);
+        scrollTerminalToBottom();
+      });
+
+      document.addEventListener("selectionchange", () => {
+        if (selectionInsideTerminal()) setRefreshPaused(true);
+      });
+
       void (async () => {
         await loadSettings();
-        await loadLogs();
+        await loadLogs(true);
       })();
-      window.setInterval(() => void loadLogs(), 3000);
+      window.setInterval(() => void loadLogs(false), 3000);
     </script>
   </body>
 </html>

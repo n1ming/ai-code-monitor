@@ -2,11 +2,15 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import {
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   ExternalLink,
   FileText,
   Folder,
   Pencil,
+  Pause,
   Plus,
+  Play,
   RefreshCw,
   Save,
   Search,
@@ -142,7 +146,7 @@ function fromApiWorkspace(workspace: ApiWorkspace): Workspace {
     status: workspace.status,
     runtime: workspace.runtime,
     runtimeLoadedAt: Date.now(),
-    logs: workspace.logs.map(cleanLogLine).filter(Boolean),
+    logs: workspace.logs.map(cleanLogLine).filter((line) => line.trim().length > 0),
     runtimeStatus: workspace.runtime_status ?? emptyRuntimeStatus(workspace.process_ids)
   };
 }
@@ -460,20 +464,13 @@ function App() {
                 <ProcessPidLink workspace={workspace} field="agent" label="Agent" />
                 <ProcessPidLink workspace={workspace} field="watch" label="Monitor" />
               </div>
-              <div className={`log-drawer ${openLogs[workspace.id] ? "open" : ""}`}>
-                <div className="log-toolbar">
-                  <h3>最新日志</h3>
-                  <label className="log-limit">
-                    显示条数
-                    <input type="number" min={10} max={5000} value={logLimit} onChange={(event) => setLogLimit(Number(event.target.value))} />
-                  </label>
-                </div>
-                <div className="logs">
-                  {workspace.logs.slice(0, logLimit).map((line, index) => (
-                    <div className={logLineClass(line)} key={`${workspace.id}-${index}-${line}`}>{cleanLogLine(line)}</div>
-                  ))}
-                </div>
-              </div>
+              <WorkspaceLogDrawer
+                workspaceId={workspace.id}
+                open={Boolean(openLogs[workspace.id])}
+                logs={workspace.logs}
+                logLimit={logLimit}
+                onLogLimitChange={setLogLimit}
+              />
             </article>
           ))}
         </section>
@@ -533,6 +530,218 @@ function ProcessPidLink({ workspace, field, label }: { workspace: Workspace; fie
       <em className={`pid-state ${displayStatus}`}>{displayStatus}{workspace.status === "running" && runtime.os_pid ? ` · ${runtime.os_pid}` : ""}</em>
     </a>
   );
+}
+
+type ParsedLogRecord = {
+  timestamp: string | null;
+  level: string;
+  body: string;
+  summary: string;
+  lineCount: number;
+  collapsible: boolean;
+  codeLike: boolean;
+};
+
+function WorkspaceLogDrawer({
+  workspaceId,
+  open,
+  logs,
+  logLimit,
+  onLogLimitChange
+}: {
+  workspaceId: string;
+  open: boolean;
+  logs: string[];
+  logLimit: number;
+  onLogLimitChange: (value: number) => void;
+}) {
+  const feedRef = React.useRef<HTMLDivElement | null>(null);
+  const [paused, setPaused] = React.useState(false);
+  const [displayLogs, setDisplayLogs] = React.useState<string[]>(() => logs.slice(0, logLimit));
+
+  const latestLogs = React.useMemo(() => logs.slice(0, logLimit), [logs, logLimit]);
+
+  React.useEffect(() => {
+    if (!open) {
+      setPaused(false);
+      return;
+    }
+    if (!paused) setDisplayLogs(latestLogs);
+  }, [latestLogs, open, paused]);
+
+  React.useEffect(() => {
+    if (!open || paused || !feedRef.current) return;
+    feedRef.current.scrollTop = feedRef.current.scrollHeight;
+  }, [displayLogs, open, paused]);
+
+  const syncLatest = () => {
+    setPaused(false);
+    setDisplayLogs(latestLogs);
+    if (feedRef.current) {
+      requestAnimationFrame(() => {
+        if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
+      });
+    }
+  };
+
+  const handleScroll = () => {
+    const panel = feedRef.current;
+    if (!panel) return;
+    const atBottom = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 24;
+    if (atBottom) {
+      setPaused(false);
+    } else {
+      setPaused(true);
+    }
+  };
+
+  const handleMouseUp = () => {
+    const panel = feedRef.current;
+    if (!panel) return;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed) return;
+    const anchor = selection.anchorNode;
+    if (anchor && panel.contains(anchor)) setPaused(true);
+  };
+
+  return (
+    <div className={`log-drawer ${open ? "open" : ""}`}>
+      <div className="log-toolbar">
+        <div className="log-toolbar-left">
+          <h3>最新日志</h3>
+          <span className={`log-state ${paused ? "paused" : "live"}`}>{paused ? "已暂停刷新" : "自动跟随最新"}</span>
+        </div>
+        <div className="log-toolbar-actions">
+          <button className="btn-icon" type="button" onClick={syncLatest} title="立即同步最新日志">
+            <RefreshCw size={15} />
+          </button>
+          <button
+            className="btn-icon"
+            type="button"
+            onClick={() => (paused ? syncLatest() : setPaused(true))}
+            title={paused ? "恢复自动刷新" : "暂停自动刷新"}
+          >
+            {paused ? <Play size={15} /> : <Pause size={15} />}
+          </button>
+          <label className="log-limit">
+            显示条数
+            <input type="number" min={10} max={5000} value={logLimit} onChange={(event) => onLogLimitChange(Number(event.target.value))} />
+          </label>
+        </div>
+      </div>
+      <div className={`logs ${paused ? "paused" : ""}`} ref={feedRef} onScroll={handleScroll} onMouseUp={handleMouseUp} onCopy={() => setPaused(true)}>
+        {displayLogs.map((line, index) => (
+          <LogRecordView key={`${workspaceId}-${index}-${line}`} raw={line} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function LogRecordView({ raw }: { raw: string }) {
+  const record = React.useMemo(() => parseLogRecord(raw), [raw]);
+  const levelClass = logLevelClass(record.level);
+  const detailsClass = `log-entry ${levelClass}${record.collapsible ? " collapsible" : ""}${record.codeLike ? " code" : ""}`;
+  const meta = (
+    <div className="log-entry-head">
+      <span className={`log-pill ${levelClass}`}>{record.level}</span>
+      {record.timestamp ? <time className="log-timestamp">{record.timestamp}</time> : null}
+      <span className="log-summary">{record.summary}</span>
+      {record.collapsible ? <span className="log-line-count">{record.lineCount} 行</span> : null}
+    </div>
+  );
+
+  if (!record.collapsible) {
+    return (
+      <article className={detailsClass}>
+        {meta}
+      </article>
+    );
+  }
+
+  return (
+    <details className={detailsClass}>
+      <summary>
+        <div className="log-entry-head">
+          <ChevronRight className="log-disclosure closed" size={14} />
+          <ChevronDown className="log-disclosure open" size={14} />
+          <span className={`log-pill ${levelClass}`}>{record.level}</span>
+          {record.timestamp ? <time className="log-timestamp">{record.timestamp}</time> : null}
+          <span className="log-summary">{record.summary}</span>
+          <span className="log-line-count">{record.lineCount} 行</span>
+        </div>
+      </summary>
+      <div className="log-entry-body">{renderLogBody(record)}</div>
+    </details>
+  );
+}
+
+function renderLogBody(record: ParsedLogRecord) {
+  if (record.codeLike) {
+    return <pre className="log-code-block">{record.body}</pre>;
+  }
+  return <div className="log-text-block">{record.body}</div>;
+}
+
+function parseLogRecord(value: string): ParsedLogRecord {
+  const clean = cleanLogLine(value);
+  const lines = clean.split("\n");
+  const firstLine = (lines[0] ?? "").trimStart();
+  const match = firstLine.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(ERROR|WARNING|WARN|DEBUG|SUCCESS|INFO)\s+(.*)$/s);
+  let timestamp: string | null = null;
+  let level = "INFO";
+  let body = clean;
+
+  if (match) {
+    timestamp = match[1];
+    level = normalizeLogLevel(match[2]);
+    body = [match[3], ...lines.slice(1)].join("\n").trimEnd();
+  } else {
+    const levelMatch = firstLine.match(/\b(ERROR|WARNING|WARN|DEBUG|SUCCESS|INFO)\b/);
+    if (levelMatch) level = normalizeLogLevel(levelMatch[1]);
+  }
+
+  const normalizedBody = body.trimEnd();
+  const lineCount = normalizedBody ? normalizedBody.split("\n").length : 0;
+  const previewLines = normalizedBody
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const summaryText = previewLines.join(" ");
+  const summary = summaryText.length > 160 ? `${summaryText.slice(0, 160)}…` : summaryText;
+  const codeLike = looksLikeCodeBlock(normalizedBody);
+  const collapsible = codeLike || lineCount > 1 || normalizedBody.length > 240;
+
+  return {
+    timestamp,
+    level,
+    body: normalizedBody,
+    summary: summary || normalizedBody.slice(0, 160),
+    lineCount,
+    collapsible,
+    codeLike,
+  };
+}
+
+function normalizeLogLevel(level: string) {
+  return level.toUpperCase() === "WARN" ? "WARNING" : level.toUpperCase();
+}
+
+function logLevelClass(level: string) {
+  const normalized = normalizeLogLevel(level);
+  if (normalized === "ERROR") return "error";
+  if (normalized === "WARNING") return "warn";
+  if (normalized === "DEBUG") return "debug";
+  if (normalized === "SUCCESS") return "success";
+  return "info";
+}
+
+function looksLikeCodeBlock(text: string) {
+  if (!text) return false;
+  if (text.includes("```")) return true;
+  if (text.split("\n").length > 1) return true;
+  if (text.length > 280) return true;
+  return /(?:^|\s)(?:function|class|const|let|var|import|export|SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|if\s*\(|for\s*\(|while\s*\(|=>|def\s+|return\s+|print\(|console\.|async\s+function)\b/i.test(text);
 }
 
 function ConfirmDeleteModal({
@@ -1171,15 +1380,6 @@ function formatRuntimeSeconds(totalSeconds: number) {
   return [hours, minutes, remainingSeconds].map((part) => String(part).padStart(2, "0")).join(":");
 }
 
-function logLineClass(line: string) {
-  const clean = cleanLogLine(line);
-  if (clean.includes(" ERROR ")) return "log-line error";
-  if (clean.includes(" WARNING ") || clean.includes(" WARN ")) return "log-line warn";
-  if (clean.includes(" DEBUG ")) return "log-line debug";
-  if (clean.includes(" SUCCESS ")) return "log-line success";
-  return "log-line info";
-}
-
 function cleanLogLine(line: string) {
   return line
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)?/g, "")
@@ -1187,7 +1387,8 @@ function cleanLogLine(line: string) {
     .replace(/\x1b/g, "")
     .replace(/^\s*\d{1,3}(?:\s+|(?=[^\d\s]))/, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
-    .trim();
+    .replace(/\r\n?/g, "\n")
+    .trimEnd();
 }
 
 createRoot(document.getElementById("root")!).render(
