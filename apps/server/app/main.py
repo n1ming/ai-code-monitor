@@ -1485,16 +1485,31 @@ def _app_watchdog_source(workspace: Workspace, process_ids: WorkspaceProcessIds)
                 file.write(f"{{color}}{{now()}} {{level}} {{message}}{{RESET}}\\n")
 
 
+        def process_is_zombie(pid: int) -> bool:
+            try:
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "stat="],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except Exception as exc:
+                log("DEBUG", f"检查进程状态失败，OS PID: {{pid}}, error: {{exc}}")
+                return False
+            return result.returncode == 0 and result.stdout.strip().startswith("Z")
+
+
         def pid_alive(pid: int) -> bool:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
                 return False
             except PermissionError:
-                return True
+                return not process_is_zombie(pid)
             except OSError:
                 return False
-            return True
+            return not process_is_zombie(pid)
 
 
         def read_runtime() -> dict[str, object]:
@@ -1962,16 +1977,31 @@ def _monitor_script_source() -> str:
             return True
 
 
+        def process_is_zombie(pid: int) -> bool:
+            try:
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "stat="],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except Exception as exc:
+                log("DEBUG", f"检查进程状态失败，OS PID: {pid}, error: {exc}")
+                return False
+            return result.returncode == 0 and result.stdout.strip().startswith("Z")
+
+
         def pid_alive(pid: int) -> bool:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
                 return False
             except PermissionError:
-                return True
+                return not process_is_zombie(pid)
             except OSError:
                 return False
-            return True
+            return not process_is_zombie(pid)
 
 
         def read_app_runtime() -> dict[str, object] | None:
@@ -1995,6 +2025,7 @@ def _monitor_script_source() -> str:
                 "未找到或无法读取 App runtime 文件" in issue
                 or "App runtime 未记录有效 OS PID" in issue
                 or "不存在，说明启动脚本已经停止" in issue
+                or "是 zombie 进程" in issue
                 or "App 日志文件不存在" in issue
             )
 
