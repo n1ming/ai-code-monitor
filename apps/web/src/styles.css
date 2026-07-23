@@ -518,32 +518,6 @@ h1, h2, h3, p { margin: 0; }
   overscroll-behavior: contain;
 }
 
-.logs.paused {
-  border-color: #61708a;
-  box-shadow: inset 0 0 0 1px rgba(124, 145, 172, .2);
-}
-
-.log-state {
-  display: inline-flex;
-  align-items: center;
-  min-height: 22px;
-  padding: 0 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 800;
-  white-space: nowrap;
-}
-
-.log-state.live {
-  color: #167645;
-  background: #eaf7ef;
-}
-
-.log-state.paused {
-  color: #a92f2f;
-  background: #fff0f0;
-}
-
 .log-entry {
   padding: 3px 0;
   border: 0;
@@ -590,28 +564,22 @@ h1, h2, h3, p { margin: 0; }
 }
 
 .log-entry.code summary {
-  padding: 6px 8px;
+  padding: 5px 0;
   border: 1px solid #263244;
-  border-radius: 8px;
-  background: #0f1720;
+  border-width: 1px 0;
+  border-radius: 0;
+  background: transparent;
 }
 
-.log-disclosure {
+.log-entry.code summary .log-entry-head::before {
+  content: ">";
   flex: 0 0 auto;
-  margin-top: 2px;
   color: #8da2bc;
+  font-weight: 850;
 }
 
-.log-disclosure.open {
-  display: none;
-}
-
-.log-entry[open] .log-disclosure.closed {
-  display: none;
-}
-
-.log-entry[open] .log-disclosure.open {
-  display: inline-flex;
+.log-entry.code[open] summary .log-entry-head::before {
+  content: "v";
 }
 
 .log-pill {
@@ -677,15 +645,16 @@ h1, h2, h3, p { margin: 0; }
 }
 
 .log-code-block {
-  margin: 6px 0 0;
-  padding: 8px 10px;
+  margin: 4px 0 2px;
+  padding: 8px 0 8px 12px;
   border: 1px solid #2d3a4e;
+  border-width: 0 0 0 2px;
   border-radius: 8px;
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: #dce7f6;
-  background: #0b1320;
+  background: transparent;
   scrollbar-gutter: stable;
 }
 

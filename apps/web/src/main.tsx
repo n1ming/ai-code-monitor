@@ -2,15 +2,11 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import {
   CheckCircle2,
-  ChevronDown,
-  ChevronRight,
   ExternalLink,
   FileText,
   Folder,
   Pencil,
-  Pause,
   Plus,
-  Play,
   RefreshCw,
   Save,
   Search,
@@ -542,6 +538,59 @@ type ParsedLogRecord = {
   codeLike: boolean;
 };
 
+function rebuildLogSummary(record: ParsedLogRecord): ParsedLogRecord {
+  const lineCount = record.body ? record.body.split("\n").length : 0;
+  const summaryText = record.body
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ");
+  const summary = summaryText.length > 160 ? `${summaryText.slice(0, 160)}...` : summaryText;
+  return {
+    ...record,
+    summary: summary || record.body.slice(0, 160),
+    lineCount,
+    collapsible: record.codeLike,
+  };
+}
+
+function combineFencedCodeRecords(records: ParsedLogRecord[]) {
+  const combined: ParsedLogRecord[] = [];
+  let buffer: ParsedLogRecord[] = [];
+  let inFence = false;
+
+  const flushBuffer = () => {
+    if (!buffer.length) return;
+    const [first] = buffer;
+    const body = buffer
+      .map((item) => item.body)
+      .join("\n")
+      .replace(/^```[^\n]*\n?/, "")
+      .replace(/\n?```\s*$/, "")
+      .trimEnd();
+    combined.push(rebuildLogSummary({ ...first, body, codeLike: true, collapsible: true }));
+    buffer = [];
+  };
+
+  for (const record of records) {
+    const fenceCount = (record.body.match(/```/g) || []).length;
+    if (inFence || fenceCount > 0) {
+      buffer.push(record);
+      if (fenceCount % 2 === 1) {
+        inFence = !inFence;
+        if (!inFence) flushBuffer();
+      } else if (!inFence) {
+        flushBuffer();
+      }
+      continue;
+    }
+    combined.push(record);
+  }
+
+  flushBuffer();
+  return combined;
+}
+
 function WorkspaceLogDrawer({
   workspaceId,
   open,
@@ -556,42 +605,33 @@ function WorkspaceLogDrawer({
   onLogLimitChange: (value: number) => void;
 }) {
   const feedRef = React.useRef<HTMLDivElement | null>(null);
-  const [paused, setPaused] = React.useState(false);
+  const [holdUpdates, setHoldUpdates] = React.useState(false);
   const [displayLogs, setDisplayLogs] = React.useState<string[]>(() => logs.slice(0, logLimit));
 
   const latestLogs = React.useMemo(() => logs.slice(0, logLimit), [logs, logLimit]);
+  const parsedRecords = React.useMemo(() => combineFencedCodeRecords(displayLogs.map(parseLogRecord)), [displayLogs]);
 
   React.useEffect(() => {
     if (!open) {
-      setPaused(false);
+      setHoldUpdates(false);
       return;
     }
-    if (!paused) setDisplayLogs(latestLogs);
-  }, [latestLogs, open, paused]);
+    if (!holdUpdates) setDisplayLogs(latestLogs);
+  }, [latestLogs, open, holdUpdates]);
 
   React.useEffect(() => {
-    if (!open || paused || !feedRef.current) return;
+    if (!open || holdUpdates || !feedRef.current) return;
     feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [displayLogs, open, paused]);
-
-  const syncLatest = () => {
-    setPaused(false);
-    setDisplayLogs(latestLogs);
-    if (feedRef.current) {
-      requestAnimationFrame(() => {
-        if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-      });
-    }
-  };
+  }, [displayLogs, open, holdUpdates]);
 
   const handleScroll = () => {
     const panel = feedRef.current;
     if (!panel) return;
     const atBottom = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 24;
     if (atBottom) {
-      setPaused(false);
+      setHoldUpdates(false);
     } else {
-      setPaused(true);
+      setHoldUpdates(true);
     }
   };
 
@@ -601,7 +641,7 @@ function WorkspaceLogDrawer({
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed) return;
     const anchor = selection.anchorNode;
-    if (anchor && panel.contains(anchor)) setPaused(true);
+    if (anchor && panel.contains(anchor)) setHoldUpdates(true);
   };
 
   return (
@@ -609,37 +649,24 @@ function WorkspaceLogDrawer({
       <div className="log-toolbar">
         <div className="log-toolbar-left">
           <h3>最新日志</h3>
-          <span className={`log-state ${paused ? "paused" : "live"}`}>{paused ? "已暂停刷新" : "自动跟随最新"}</span>
         </div>
         <div className="log-toolbar-actions">
-          <button className="btn-icon" type="button" onClick={syncLatest} title="立即同步最新日志">
-            <RefreshCw size={15} />
-          </button>
-          <button
-            className="btn-icon"
-            type="button"
-            onClick={() => (paused ? syncLatest() : setPaused(true))}
-            title={paused ? "恢复自动刷新" : "暂停自动刷新"}
-          >
-            {paused ? <Play size={15} /> : <Pause size={15} />}
-          </button>
           <label className="log-limit">
             显示条数
             <input type="number" min={10} max={5000} value={logLimit} onChange={(event) => onLogLimitChange(Number(event.target.value))} />
           </label>
         </div>
       </div>
-      <div className={`logs ${paused ? "paused" : ""}`} ref={feedRef} onScroll={handleScroll} onMouseUp={handleMouseUp} onCopy={() => setPaused(true)}>
-        {displayLogs.map((line, index) => (
-          <LogRecordView key={`${workspaceId}-${index}-${line}`} raw={line} />
+      <div className="logs" ref={feedRef} onScroll={handleScroll} onMouseUp={handleMouseUp} onCopy={() => setHoldUpdates(true)}>
+        {parsedRecords.map((record, index) => (
+          <LogRecordView key={`${workspaceId}-${index}-${record.timestamp ?? ""}-${record.body}`} record={record} />
         ))}
       </div>
     </div>
   );
 }
 
-function LogRecordView({ raw }: { raw: string }) {
-  const record = React.useMemo(() => parseLogRecord(raw), [raw]);
+function LogRecordView({ record }: { record: ParsedLogRecord }) {
   const levelClass = logLevelClass(record.level);
   const detailsClass = `log-entry ${levelClass}${record.collapsible ? " collapsible" : ""}${record.codeLike ? " code" : ""}`;
 
@@ -661,8 +688,6 @@ function LogRecordView({ raw }: { raw: string }) {
     <details className={detailsClass}>
       <summary>
         <div className="log-entry-head">
-          <ChevronRight className="log-disclosure closed" size={14} />
-          <ChevronDown className="log-disclosure open" size={14} />
           <span className={`log-pill ${levelClass}`}>{record.level}</span>
           {record.timestamp ? <time className="log-timestamp">{record.timestamp}</time> : null}
           <span className="log-summary">{record.summary}</span>
